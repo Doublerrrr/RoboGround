@@ -272,7 +272,7 @@ def main() -> int:
                     help="SUN RGB-D 场景下标（索引里的位置）")
     ap.add_argument("--views", type=int, default=6, help="虚拟视角数")
     ap.add_argument("--max-side", type=int, default=320, help="图像长边上限（加速）")
-    ap.add_argument("--out-dir", default="runs", help="图片输出目录")
+    ap.add_argument("--out-dir", default="docs/figures",`n                    help="图片输出目录（默认进仓库的 docs/figures，便于 GitHub 上直接看）")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
 
