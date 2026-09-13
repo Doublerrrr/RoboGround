@@ -91,9 +91,15 @@ class PanoScene:
         为什么要按距离筛：GT 覆盖整个房间（含背后的墙、隔壁的物体），
         而全景只看到 360° 视野内、且 `max_depth` 以内的东西。
         不筛的话评测会把"根本看不见"的物体算成漏检。
+
+        空结果返回 `(0, 7)` 数组 + `[]`（**不是** `None`），
+        且 dtype 与 `gt_boxes` 一致（上游 `objects_as_boxes` 给的是 float32；
+        早先这里写死 `np.zeros((0,7))` 会变成 float64，
+        下游拼接/比较时可能因 dtype 不同而产生意外行为）。
         """
+        dt = np.float32 if self.gt_boxes is None else self.gt_boxes.dtype
         if self.gt_boxes is None or self.gt_boxes.shape[0] == 0:
-            return np.zeros((0, 7)), []
+            return np.zeros((0, 7), dtype=dt), []
         B = self.gt_boxes
         c = np.asarray(self.center, dtype=np.float64).reshape(3)
         # 用"框中心到光心的距离 − 框外接球半径"作为下界，保守地筛
@@ -112,7 +118,7 @@ class PanoScene:
         keep = [i for i in range(B.shape[0])
                 if near[i] and (want is None or self.gt_labels[i].lower() in want)]
         if not keep:
-            return np.zeros((0, 7)), []
+            return np.zeros((0, 7), dtype=dt), []
         idx = np.asarray(keep, dtype=int)
         return B[idx], [self.gt_labels[i] for i in idx]
 
@@ -336,7 +342,8 @@ def _box_surface_points(box: np.ndarray, grid: int = 6) -> np.ndarray:
 def box_to_pano(scene: PanoScene, box: np.ndarray, *,
                 grid: int = 6,
                 occ_tol_abs: float = 0.30,
-                occ_tol_rel: float = 0.10) -> Optional[Dict[str, Any]]:
+                occ_tol_rel: float = 0.10,
+                min_visible_frac: float = 0.25) -> Optional[Dict[str, Any]]:
     """把一个世界系轴对齐 GT 框投到全景图上，并判定**可见性**。
 
     返回 `dict`（完全不可见时返回 None），含：
@@ -355,6 +362,8 @@ def box_to_pano(scene: PanoScene, box: np.ndarray, *,
     所以"完全看得见"的物体也只会有 ~50% 左右，**不会接近 100%**。
     默认阈值 `min_visible_frac=0.25` 的含义就是"朝向相机的那一面至少看到一半"。
     不要把这个数读成"看到了物体的百分之多少"。
+    该阈值会**透传给 `box_to_pano`**，保证条目里的 `visible` 字段
+    与本函数的筛选口径一致。
 
     遮挡判据：某采样点被判定为"可见"，当且仅当该方向**有有效深度**，
     且观测到的斜距**不小于**该点的斜距（允许 `occ_tol` 容差）——
@@ -436,7 +445,10 @@ def box_to_pano(scene: PanoScene, box: np.ndarray, *,
         "range_m": float(np.median(r)),
         "visible_frac": float(vis.mean()),
         "covered_frac": float(covered.mean()),
-        "visible": bool(vis.mean() >= 0.25),
+        # ★ 门限由参数传入，**不再硬编码** 0.25：否则
+        #   `visible_gt(min_visible_frac=0.5)` 会用它筛完，
+        #   而条目里的 `visible` 仍按 0.25 判定，同一份数据两处结论不一致。
+        "visible": bool(vis.mean() >= float(min_visible_frac)),
     }
 
 
@@ -456,7 +468,8 @@ def visible_gt(scene: PanoScene, *, max_range_m: float = 8.0,
     boxes, labels = scene.gt_within(max_range_m, classes)
     out: List[Dict[str, Any]] = []
     for i in range(boxes.shape[0]):
-        info = box_to_pano(scene, boxes[i], grid=grid)
+        info = box_to_pano(scene, boxes[i], grid=grid,
+                           min_visible_frac=min_visible_frac)
         if info is None or info["visible_frac"] < float(min_visible_frac):
             continue
         out.append({"box": boxes[i], "label": labels[i],

@@ -806,8 +806,10 @@ def test_visible_gt_entries_carry_projection_fields(half_covered_scene):
         assert o["range_m"] > 0.0, f"range_m 应为正：{o['range_m']}"
         u0, v0, u1, v1 = o["uv"]
         assert 0 <= v0 <= v1 <= H - 1, f"行坐标必须在 [0, {H - 1}] 内：{o['uv']}"
-        # 注意：这里**不**断言 u 落在 [0, W-1] —— 跨接缝的框会给出 u1 == W
-        # 甚至更大（见模块 docstring 的"已知的可疑行为"），列坐标没做取模。
+        # ★ 列坐标现在也**必须落在图内**（跨接缝的框会被拆成两段，
+        #   见 `uv_parts`）。早先这里会返回 u1 > W 的越界框，
+        #   下游 `img[v0:v1, u0:u1]` 会被 numpy 静默截断。
+        assert 0 <= u0 <= u1 <= W - 1, f"列坐标必须在 [0, {W - 1}] 内：{o['uv']}"
         assert all(float(x).is_integer() for x in o["uv"]), \
             f"uv 应当是整数像素坐标（要拿去索引图像），实际 {o['uv']}"
         assert "index" in o, "条目里还应有它在 `gt_within` 结果里的下标，便于回溯"
@@ -880,3 +882,61 @@ def test_gt_within_empty_result_is_empty_array_not_none(gt_boxes_and_labels):
     # 空结果必须能**直接喂给** visible_gt（返回空列表而不是崩）
     assert visible_gt(scene, max_range_m=8.0, classes=["nosuch"]) == []
     assert visible_gt(no_gt, max_range_m=8.0) == []
+
+# ==========================================================================
+# 10) 两处口径一致性（都曾是"同一份数据两处结论不同"的隐患）
+# ==========================================================================
+def test_gt_within_empty_result_dtype_matches_nonempty(gt_boxes_and_labels):
+    """★ 空结果与正常结果的 **dtype 必须一致**。
+
+    上游 `objects_as_boxes` 给的是 float32，而早先这里写死
+    `np.zeros((0, 7))`（float64）—— 空/非空两条路径 dtype 不同，
+    下游做 `np.concatenate` 或 dtype 敏感的比较时会出意外。
+    """
+    boxes, labels = gt_boxes_and_labels
+    scene = _scene(_pano(3.0), boxes, labels)
+
+    nonempty, _ = scene.gt_within(8.0)
+    assert nonempty.shape[0] > 0, "这条测试需要一个非空结果"
+    empty, empty_labels = scene.gt_within(1e-6)      # 半径极小 → 什么都不剩
+    assert empty.shape == (0, 7) and empty_labels == []
+
+    assert empty.dtype == nonempty.dtype == scene.gt_boxes.dtype, (
+        f"空结果 dtype={empty.dtype} 与正常结果 dtype={nonempty.dtype} / "
+        f"gt_boxes dtype={scene.gt_boxes.dtype} 不一致")
+
+    # 没有 GT 时（gt_boxes=None）也不该崩，且仍返回 (0,7)
+    bare = _scene(_pano(3.0))
+    b, bl = bare.gt_within(8.0)
+    assert b.shape == (0, 7) and bl == []
+
+
+def test_visible_gt_threshold_is_passed_through_to_box_to_pano(half_covered_scene):
+    """★ `visible_gt` 的门限必须**透传**给 `box_to_pano`，两处口径不能各说各话。
+
+    早先 `box_to_pano` 把 `visible` 硬编码在 0.25：用
+    `visible_gt(min_visible_frac=0.9)` 筛出来的条目，其 `visible` 字段
+    仍按 0.25 判定 —— 同一份数据两处结论不一致，而且很难发现。
+    """
+    scene = half_covered_scene
+
+    # 用两个差很多的门限，断言返回条目里的 visible 字段与所用门限自洽
+    for thr in (0.0, 0.25, 0.75):
+        got = visible_gt(scene, max_range_m=1e3, min_visible_frac=thr)
+        for o in got:
+            assert o["visible_frac"] >= thr - 1e-9, (
+                f"门限 {thr} 下仍返回了 visible_frac={o['visible_frac']:.4f} 的物体")
+            assert o["visible"] == (o["visible_frac"] >= thr - 1e-9), (
+                f"条目的 visible={o['visible']} 与门限 {thr} 不自洽"
+                f"（visible_frac={o['visible_frac']:.4f}）")
+
+    # 门限严格大于 1.0 时应当一个都不剩（visible_frac 是比例，上界就是 1.0）。
+    # ⚠️ **不能**拿 1.0 当门限做这个断言：实测这个 fixture 里的物体确实能到 1.0
+    #   （合成全景的深度是常数，物体没有被任何更近的表面挡住），
+    #   只有严格大于 1.0 的门限才保证空集。
+    assert visible_gt(scene, max_range_m=1e3, min_visible_frac=1.0 + 1e-6) == [], \
+        "门限大于 1.0 时不可能有物体满足（visible_frac ≤ 1.0）"
+    # 反过来，门限放松后返回的物体数不应减少（确认门限真的在起作用）
+    assert len(visible_gt(scene, max_range_m=1e3, min_visible_frac=0.0)) >= \
+        len(visible_gt(scene, max_range_m=1e3, min_visible_frac=0.25)), \
+        "门限放松后返回的物体数不应减少"
