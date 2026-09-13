@@ -1,0 +1,65 @@
+# ==========================================================================
+# 真实数据（SUN RGB-D）+ 大批量 prompts：用于评测与自动标注
+# ==========================================================================
+# 前置：先建索引
+#     python scripts/02_build_sunrgbd_index.py
+#
+# 用法：
+#     python scripts/05_benchmark.py --source sunrgbd --scenes 20 --config configs/sunrgbd.yaml
+#     python scripts/06_auto_label.py --source sunrgbd --scenes 50 --config configs/sunrgbd.yaml
+# ==========================================================================
+
+data:
+  # SUN RGB-D 的 GT 3D 框标注远不止 10 类，这里放开更多类别，
+  # 让"开放词汇"这件事在真实数据上也有足够的类别多样性可看
+  root: data
+  sunrgbd_processed: G:/Embodied3D/data/processed
+  num_workers: 0
+  sequence_length: 8
+
+perception:
+  detector: stub            # 用 GT 框投影（离线、可定量评估）
+  segmenter: box
+  encoder: color_hist
+  prompts:
+    - bed
+    - table
+    - sofa
+    - chair
+    - toilet
+    - desk
+    - cabinet
+    - nightstand
+    - bookshelf
+    - bathtub
+    - door
+    - window
+    - monitor
+    - box
+    - bottle
+    - cup
+    - lamp
+    - pillow
+    - bag
+    - person
+    - trash can
+    - sink
+    - refrigerator
+    - clock
+    - picture
+
+geometry:
+  depth_scale: 10000.0      # ⚠️ SUN RGB-D 是 /10000（不是 /1000）
+  min_depth: 0.20
+  max_depth: 8.00
+  voxel_size: 0.06
+  depth_trunc_percentile: 99.0
+
+mapping:
+  object_mode: association
+  assoc_radius: 0.60
+  object_bbox_percentile: 2.0
+
+eval:
+  iou_thresholds: [0.25, 0.50]
+  top_k: [1, 5]

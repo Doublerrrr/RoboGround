@@ -1,0 +1,111 @@
+# ==========================================================================
+# RoboGround 默认配置（全离线：无模型权重 / 无网络 / 无 GPU 也能跑通全链路）
+# ==========================================================================
+# 只写你想改的字段即可 —— 未出现的键自动从内置 DEFAULT_CONFIG 继承。
+# 命令行覆盖：roboground demo --config configs/default.yaml
+# 环境变量覆盖：ROBOGROUND_GEOMETRY__VOXEL_SIZE=0.03
+# ==========================================================================
+
+project:
+  name: RoboGround
+  seed: 42
+  device: cuda          # 无 GPU 时自动回退 cpu
+  output_dir: runs/default
+
+# ---------------- Stage 1：开放词汇 2D 感知 ----------------
+perception:
+  # 离线后端（默认）：无依赖、确定性，用 GT 框投影出检测
+  detector: stub        # stub | grounding_dino | yolo
+  segmenter: box        # box | sam
+  encoder: color_hist   # color_hist | dinov2 | clip
+  # 自然语言提示词 —— 换 prompt 就换"要找什么"（开放词汇的核心）
+  prompts:
+    - chair
+    - table
+    - desk
+    - monitor
+    - door
+    - window
+    - bookshelf
+    - trash can
+    - box
+    - bottle
+    - sofa
+    - bed
+  detector_kwargs:
+    box_threshold: 0.30
+    text_threshold: 0.25
+  segmenter_kwargs:
+    shrink: 0.0         # bbox 内缩比例（略内缩可减少背景点）
+  encoder_kwargs:
+    feature_dim: 72     # color_hist 的维度（会被后端原生维度覆盖）
+
+# ---------------- 几何 ----------------
+geometry:
+  depth_scale: 1000.0   # 原始深度 → 米：depth_m = raw / depth_scale
+  min_depth: 0.10
+  max_depth: 8.00
+  voxel_size: 0.05      # 体素边长（米）—— 3D 特征场的分辨率
+  max_points_per_frame: 200000
+  depth_trunc_percentile: 99.0   # 幽灵点过滤（玻璃穿透产生的虚远点）
+
+# ---------------- Stage 2：3D 语义地图 ----------------
+mapping:
+  fusion: mean                  # mean | max | confidence_weighted
+  object_mode: association      # association（推荐）| clustering（降级）
+  assoc_radius: 0.60            # 跨帧关联：中心距离阈值（米）
+  assoc_iou: 0.10               # 或 3D IoU 超过该值也算同一物体
+  assoc_require_label: true     # 关联时要求标签语义兼容
+  cluster_eps: 0.08
+  cluster_min_samples: 3
+  object_bbox_percentile: 2.0   # bbox 分位数裁剪，抗离群点
+  max_voxels: 2000000
+
+# ---------------- 语言查询 ----------------
+query:
+  top_k: 5
+  # 词法路径的接受阈值。词法打分分三层：
+  #   ① 规范概念命中 1.00  ② 子串包含 0.85  ③ 字符 bigram Jaccard ≤ 0.80
+  # 第三层是**纯噪声源** —— 任意两词只要共享少量 bigram 就有分
+  # （实测 bicycle↔bottle 共享 "le" → 0.145）。所以阈值必须**高于噪声层、
+  # 低于真信号层**，0.5 是实测最优：拒识率 72.2%→100%，命名类命中率不降，
+  # 综合分 0.603→0.828（`scripts/16_eval_openvocab_query.py`）。
+  min_score_lexical: 0.5
+  # 嵌入路径的阈值。**尺度与词法完全不同，不要共用**：
+  # null = 按编码器自适应（SigLIP→0.02，CLIP→空文本校准概率）。
+  min_score_embedding: null
+
+  # ⚠️ 旧键名 `min_score` 已废弃（含义等同 min_score_lexical）。
+  # 它曾经被写成 0.05，把类默认的 0.5 **静默覆盖**，导致 27.8% 的
+  # "地图里没有的类别"查询返回错误物体（AGENTS.md 二.7 / 2026-09-11 复发）。
+  # 代码仍兼容这个键（老配置不会炸），但**新配置一律用 min_score_lexical**。
+
+# ---------------- Stage 3：推理 ----------------
+reasoning:
+  backend: rules        # rules（离线可解释）| qwen2vl（需权重）
+  relations:
+    near_threshold: 0.50
+    above_delta: 0.10
+    inside_ratio: 0.60
+    axis_ratio: 0.15
+    adjacent_gap: 0.15
+  vlm:
+    model_id: Qwen/Qwen2-VL-2B-Instruct
+    max_new_tokens: 256
+    load_in_4bit: true      # 8GB 显存必须开
+    device_map: auto
+
+# ---------------- 数据 ----------------
+data:
+  root: data
+  num_workers: 0        # ⚠️ 本机沙箱必须为 0（多进程 DataLoader 会挂）
+  image_size: [480, 640]
+
+# ---------------- Stage 4：部署 ----------------
+deploy:
+  fast_tier_hz: 10.0    # 高频感知（避障级）
+  slow_tier_hz: 1.0     # 低频 VLM 推理
+  queue_size: 4
+  quantize: none        # none | fp16 | int8
+  ros2:
+    node_namespace: /roboground

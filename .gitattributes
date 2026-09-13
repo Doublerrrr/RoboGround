@@ -1,0 +1,29 @@
+# 行尾与编码策略
+#
+# 本项目对**字节级**属性有测试断言（`tests/test_script_hygiene.py`）：
+#   · `.sh`  必须 LF、**无** BOM   —— 否则 WSL 里报 `$'\r': command not found`
+#                                     或 shebang 变成 `#!/usr/bin/env bash\r`
+#   · `.ps1` 必须带 UTF-8 **BOM**  —— 否则 Windows PowerShell 5.1 按 GBK 解码，
+#                                     中文注释变乱码、甚至语法错误
+#   · `scripts/**/*.py` 不得有 BOM/CRLF
+#
+# 所以统一**以 LF 存进仓库**：任何机器 clone 出来的字节都一致，
+# 不会因为对方 `core.autocrlf=true` 就把 `.sh` 变成 CRLF。
+* text=auto eol=lf
+
+# `.ps1` 关掉一切转换：BOM 必须原样保留（这是那几个脚本能跑的前提）
+*.ps1 -text
+
+# 二进制：不做文本处理与行尾转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.pdf binary
+*.npz binary
+*.pth binary
+*.pt binary
+*.onnx binary
+*.safetensors binary
+*.ply binary
+*.glb binary

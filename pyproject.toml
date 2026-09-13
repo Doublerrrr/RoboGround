@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "roboground"
+version = "0.1.0"
+description = "面向服务机器人的开放词汇 3D 场景理解与语言接地系统"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "李相儒" }]
+keywords = ["robotics", "open-vocabulary", "3d-semantic-map", "vlm", "ros2", "embodied-ai"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# 注意：torch 不在此列表 —— 由 conda 环境 `lxr` 提供（cu124 构建）
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "PyYAML>=6.0",
+    "tqdm>=4.65",
+    "Pillow>=10.0",
+    "matplotlib>=3.7",
+]
+
+[project.optional-dependencies]
+perception = ["transformers>=4.45", "timm>=1.0", "einops>=0.7", "safetensors>=0.4"]
+vlm = ["transformers>=4.45", "peft>=0.12", "accelerate>=0.34"]
+export = ["onnx>=1.16", "onnxruntime>=1.19"]
+dev = ["pytest>=7.4", "pytest-cov>=4.1"]
+
+[project.scripts]
+roboground-check = "roboground.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+roboground = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+# 默认**跳过** slow（需要数据集/大模型），要跑时显式加 `-m slow`：
+#   pytest -m slow tests/test_sunrgbd.py -v
+addopts = "-q --strict-markers -m 'not slow'"
+markers = [
+    "slow: 需要下载模型或跑长训练的测试（默认不跑，用 -m slow 启用）",
+    "gpu: 需要 CUDA 的测试",
+    "ros: 需要 ROS2 运行时的测试",
+]
+filterwarnings = ["ignore::DeprecationWarning"]

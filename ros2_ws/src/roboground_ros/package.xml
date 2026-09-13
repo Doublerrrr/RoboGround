@@ -1,0 +1,34 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>roboground_ros</name>
+  <version>0.1.0</version>
+  <description>
+    RoboGround 的 ROS2 封装：感知节点（RGB-D → 3D 语义地图）与问答节点（自然语言 → 结构化答案）。
+    真正的算法实现在 `roboground` 包里，本包只做 ROS2 侧的接线、参数声明与启动编排。
+  </description>
+  <maintainer email="roboground@example.com">RoboGround</maintainer>
+  <license>MIT</license>
+
+  <!-- 运行依赖 -->
+  <depend>rclpy</depend>
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>message_filters</depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+
+  <!-- 测试依赖 -->
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <!-- ament_python：纯 Python 包，不需要编译 C++ -->
+    <build_type>ament_python</build_type>
+  </export>
+</package>

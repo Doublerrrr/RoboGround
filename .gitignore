@@ -1,0 +1,72 @@
+# RoboGround .gitignore
+#
+# ⚠️ **路径一律用 `/` 锚定到仓库根**。
+#
+# 这条规则是用一次真实事故换来的：原来写的是 `data/`（不带前导斜杠），
+# git 的 pattern 语义会让它匹配**任意层级**下叫 data 的目录 ——
+# 于是 `src/roboground/data/`（视频管线 + 大规模语料工程，18 个文件 / 6,306 行）
+# 被整体排除，而它恰好是面试权重最高的一个包。
+# 检查方式：`git status --ignored --porcelain src/ | Select-String '^!!'`
+#           `git check-ignore -v <某个源文件>`
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+/dist/
+*.egg-info/
+.eggs/
+.venv/
+/venv/
+/build/
+
+# ---- 测试 / 缓存 ----
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# ---- 数据与权重（大文件不入库：weights 8.4 GB / data 3.7 GB）----
+# 只忽略**仓库根**下的这两个目录；源码里的 `src/roboground/data/` 必须入库。
+/data/
+!/data/.gitkeep
+/runs/
+!/runs/.gitkeep
+/weights/
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.onnx
+*.engine
+*.npz
+*.ply
+*.glb
+
+# ---- 生成物 ----
+/outputs/
+*.log
+*.tmp
+
+# ---- ROS2 / colcon 构建产物 ----
+# `install/` 与 `log/` 加起来上千个文件；`log/latest*` 在 Windows 上是**符号链接**，
+# 会让 `git add` 与各种扫描工具报奇怪的错（已踩过，见 docs/实现笔记.md）。
+ros2_ws/install/
+ros2_ws/log/
+ros2_ws/build/
+/install/
+/log/
+
+# ---- AI 协作会话的工作日志（不属于项目内容）----
+# `.workbuddy-ai/memory/*.md` 是智能体会话的临时记忆/交接笔记，
+# 含过期数字与内部过程记录，**不适合进公开仓库** —— 对外交接用 AGENTS.md。
+.workbuddy-ai/
+
+# ---- IDE ----
+.idea/
+.vscode/
+*.swp
+.DS_Store

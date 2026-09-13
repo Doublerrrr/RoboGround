@@ -1,0 +1,68 @@
+# RoboGround 感知节点的 ROS2 参数
+#
+# 这是**启动默认值**，不是"唯一真相"：
+#   ros2 run roboground_ros perception
+#       → 不加载本文件，全部走 roboground 自己的默认配置
+#   ros2 launch roboground_ros perception.launch.py
+#       → 加载本文件（可用 params_file:=<你的.yaml> 换掉）
+#   ros2 run ... --ros-args -p sync_slop:=0.05
+#       → 显式值，优先级最高（覆盖本文件里的同名项）
+#
+# 接线表在 `roboground_ros/perception_node.py` 的 PARAM_MAP，
+# 任何一项都必须能落到 roboground Config 的**真实存在**的路径上
+# （`tests/test_ros2_package.py` 会检查）。
+#
+# 在线调参（不用重启节点）：
+#   ros2 param set /perception sync_slop 0.05
+#   ros2 param get /perception pose_source
+#   ros2 param dump /perception
+#
+perception:
+  ros__parameters:
+    # ---- 配置来源 ----
+    # 留空 = 用 roboground 的默认配置；也可以指向 configs/*.yaml
+    config_file: ""
+
+    # ---- 位姿来源（最关键的一项）----
+    # tf        : 从 TF 树查（真机推荐；需要相机驱动发布 *_optical_frame）
+    # odometry  : 订阅 nav_msgs/Odometry
+    # static    : 用固定外参 translation/rpy（调试、无 TF 时用）
+    # identity  : 恒等位姿 → 地图以第一帧相机为原点，多帧会重影
+    #             ⚠️ 只在明确知道后果时用
+    pose_source: tf
+    pose_target_frame: map
+    pose_source_frame: camera_color_optical_frame
+    # ⚠️ 只有当 `pose_source_frame` 是 **camera_link**（而非 *_optical_frame）
+    #    时才设 true。查 optical frame 时设 true 会**重复旋转**
+    #    （实测误差 1.697 m，scripts/wsl/13_diag_tf_pose.py 有 A/B/C/D 对照）。
+    optical_frame_correction: false
+    odom_topic: /odom
+
+    # ---- 同步与发布 ----
+    # 三路传感器（彩色/深度/内参）的时间同步容差（秒）。
+    # 真实相机 30 Hz 时 0.05 够用；rosbag 回放因时间戳抖动可以放宽到 0.1。
+    sync_slop: 0.05
+    publish_every_n: 10        # 每 N 帧发布一次地图（省带宽；真机可调 1）
+
+    # ---- 几何 ----
+    depth_scale: 1000.0        # 真实深度图多为 uint16 毫米 → /1000 得米
+    voxel_size: 0.05
+    min_depth: 0.1
+    max_depth: 8.0
+    autosync_depth: false      # 深度与彩色分辨率不一致时是否自动对齐
+
+    # ---- 感知后端（换真实模型改这里）----
+    detector: stub             # stub | grounding_dino | yolo
+    segmenter: box             # box | sam
+    encoder: color_hist        # color_hist | dinov2 | clip | siglip
+
+    # ---- 话题名 ----
+    # 各家机器人的话题命名差别很大（RealSense / Orbbec / 自研），必须可配。
+    # ⚠️ 这几个只在**节点构造时**读一次，改了要重启节点 ——
+    #    `ros2 param set` 对话题名不生效（ROS2 不支持运行时换订阅话题）。
+    color_image_topic: /camera/color/image_raw
+    depth_image_topic: /camera/depth/image_raw
+    camera_info_topic: /camera/color/camera_info
+    semantic_map_topic: /roboground/semantic_map
+    query_topic: /roboground/query
+    answer_topic: /roboground/answer

@@ -1,0 +1,93 @@
+# ==========================================================================
+# 真实开放词汇感知：Grounding DINO（检测）+ SAM（掩码）+ SigLIP/CLIP（图文特征）
+# ==========================================================================
+# 需要先安装可选依赖并下载权重：
+#     pip install -e ".[perception]" sentencepiece
+#     首次运行会自动从 HuggingFace 下载（约 0.7 + 0.4 + 1.6 GB）
+#
+# ⚠️ 编码器怎么选（这是实测结论，不是追新）
+# ---------------------------------------------------------------------------
+# 在真实 SUN RGB-D 上做了 (编码器 × 池化) 消融，见 scripts/11_ablate_clip_pooling.py：
+#
+#   编码器   池化   self   other  分离度   Top1  中位排名
+#   clip    crop  0.252  0.255  -0.003  0.43    2.0
+#   clip    mask  0.233  0.241  -0.009  0.20    3.0
+#   siglip  crop  0.037  0.034  +0.002  0.49    2.0
+#   siglip  mask  0.004  0.002  +0.003  0.54    1.0   ← 最优
+#
+# 结论：**CLIP ViT-B/32 的区域特征分离度为负**（"和别的类别反而更像"），
+#       基本无法区分室内家具；SigLIP 用 sigmoid 损失训练，分离度转正、
+#       中位排名达到 1.0。所以本配置默认用 siglip。
+#
+# ⚠️ 阈值注意：SigLIP 的 sigmoid 概率天然保守（命中也只有 0.01~0.05），
+#    所以 query.min_score_embedding 留 None 让引擎按编码器自适应（返回 0.02）。
+#    如果硬套 CLIP 的 0.5 阈值，SigLIP 的所有查询都会返回空。
+#
+# 显存预算（RTX 4060 8GB）：三者常驻约 1.7GB，余量充足。
+#
+# 用法：
+#     roboground map --config configs/perception_openvocab.yaml --source sunrgbd
+# ==========================================================================
+
+project:
+  device: cuda
+
+perception:
+  detector: grounding_dino
+  segmenter: sam
+  encoder: siglip               # ← 推荐；若显存/下载不便可换回 clip
+
+  # 开放词汇可以直接用自然语言描述，不必是固定类别词
+  prompts:
+    - cup
+    - table
+    - chair
+    - monitor
+    - door
+    - window
+    - trash can
+    - bottle
+    - laptop
+    - bookshelf
+
+  detector_kwargs:
+    model_id: IDEA-Research/grounding-dino-tiny
+    box_threshold: 0.30
+    text_threshold: 0.25
+    max_detections: 64
+    canonicalize_labels: true   # ★ 实测必需：把 "trash" 归一成 "trash can"、
+                                #   把跨 prompt 的合并片段（"table bookshelf"）
+                                #   映射回最匹配的 prompt，并丢弃幻觉类别
+    min_label_match: 0.5
+
+  segmenter_kwargs:
+    model_id: facebook/sam-vit-base
+    max_boxes: 32               # 每帧最多送多少个框给 SAM（控制耗时，约 75ms/框）
+    max_side: 1024
+
+  encoder_kwargs:
+    # SigLIP（推荐）。已用 local_dir 下载到项目目录时可直接填本地路径以避免
+    # Windows 符号链接权限问题：
+    #   model_id: G:/RoboGround/weights/siglip-base-patch16-224
+    model_id: google/siglip-base-patch16-224
+    pool: mask                  # 有 SAM 掩码时用 mask 剔除背景；
+                                # 无掩码（纯框）时 crop/mask 等效
+    crop_margin: 0.15           # 上下文比例：留一点周围信息，别紧贴目标
+    square: true                # ★ 扩成正方形：避免非方形裁剪被拉伸变形
+    tta: multicrop              # ★ 多视图 TTA（多尺度 + 多上下文 + 翻转，最多 8 视图）
+                                #   实测 GT 区域评测下 Top-1 +4 个绝对百分点
+                                #   代价是视图数 ×8（延迟上升，实时链路可设 none）
+
+geometry:
+  voxel_size: 0.05
+
+mapping:
+  fusion: mean
+  object_mode: association
+  assoc_radius: 0.60
+  assoc_require_label: true
+
+query:
+  min_score_lexical: 0.5        # 词法阈值，见 default.yaml 的说明（不要调低）
+  min_score_embedding: null     # null = 按编码器自适应（SigLIP→0.02，CLIP→校准概率）
+

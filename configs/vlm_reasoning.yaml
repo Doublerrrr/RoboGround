@@ -1,0 +1,36 @@
+# ==========================================================================
+# Stage 3：VLM 空间推理（Qwen2-VL + 规则引擎融合）
+# ==========================================================================
+# 需要：pip install -e ".[vlm]"
+# 显存：2B 模型 + 4bit 量化 ≈ 2.5GB（8GB 卡可跑）
+#
+# 架构说明（重要）：
+#   本项目**不**让 VLM 取代几何计算，而是"规则引擎保底 + VLM 增强"：
+#     1) 规则引擎先用几何算出精确的米制距离与空间关系；
+#     2) 把"地图摘要 + 精确关系"作为上下文喂给 VLM，让它在有事实约束下组织语言；
+#     3) VLM 不可用时无缝退回规则引擎（不会报错、不会降级到胡说）。
+#
+# 用法：
+#     roboground query runs/map.npz "厨房台面上的杯子在哪" --config configs/vlm_reasoning.yaml
+# ==========================================================================
+
+project:
+  device: cuda
+
+reasoning:
+  backend: qwen2vl
+  relations:
+    near_threshold: 0.50
+    above_delta: 0.10
+    inside_ratio: 0.60
+  vlm:
+    model_id: Qwen/Qwen2-VL-2B-Instruct
+    # 训练好 LoRA 后填路径（Stage 3 的训练产物）
+    adapter_path: null
+    max_new_tokens: 256
+    load_in_4bit: true
+    device_map: auto
+
+query:
+  top_k: 5
+  min_score_lexical: 0.5        # 词法阈值，见 default.yaml 的说明（不要调低）
