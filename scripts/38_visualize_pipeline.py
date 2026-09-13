@@ -169,7 +169,7 @@ def fig_inputs(scene: PanoScene, loc, out: Path, *, cols: int = 6) -> Path:
         axes[k].axis("off")
 
     fig.suptitle(
-        f"{scene.room}：{n} 个**真实**输入视角（同一光心、不同朝向；"
+        f"{scene.room}：{n} 个「真实」输入视角（同一光心、不同朝向；"
         f"光心离散 {scene.panorama.meta.get('center_spread_m', 0):.1e} m）\n"
         f"这些是官方在真实采集位姿上渲染的像素，不是把一张图重采样 N 次",
         fontsize=10)
@@ -214,7 +214,7 @@ def fig_fusion(scene: PanoScene, out: Path) -> Path:
     rng = np.ma.masked_where(pano.depth_m <= 0, pano.depth_m)
     im = ax2.imshow(rng, extent=[0, W, H, 0], cmap="turbo", vmin=0.4,
                     vmax=float(np.percentile(pano.depth_m[pano.depth_m > 0], 99)))
-    ax2.set_title("融合出的**斜距**（米，从光心起算；空白 = 该方向未被任何视角覆盖）",
+    ax2.set_title("融合出的斜距（米，从光心起算；空白 = 该方向未被任何视角覆盖）",
                   fontsize=9)
     ax2.set_xticks([]); ax2.set_yticks([])
     fig.colorbar(im, ax=ax2, fraction=0.025, pad=0.01).ax.tick_params(labelsize=7)
@@ -229,7 +229,7 @@ def fig_fusion(scene: PanoScene, out: Path) -> Path:
     ax3.set_title(
         f"逐仰角覆盖率：像素覆盖 {pano.coverage*100:.1f}% / "
         f"立体角覆盖 {pano.solid_angle_coverage*100:.1f}%；"
-        f"**天顶与天底为 0** —— 采集是水平环带（实测 3,345 个真实视角的光轴都在 ±23° 内）",
+        f"「天顶与天底为 0」—— 采集是水平环带（实测 3,345 个真实视角的光轴都在 ±23° 内）",
         fontsize=8)
     ax3.grid(alpha=0.3)
     ax3.tick_params(labelsize=7)
@@ -342,7 +342,7 @@ def fig_objects(scene: PanoScene, map_objects: Sequence[Any], out: Path,
         if np.all(np.isfinite(lo)) and np.all(np.isfinite(hi)) and np.all(hi > lo):
             draw_aabb_equirect(ax, scene, lo, hi, color=col, lw=0.9, alpha=0.55)
         uu.append(u[0]); vv.append(v[0])
-    ax.set_title(f"② **地图输出的物体**投回全景（{len(map_objects)} 个，★ = 物体中心，"
+    ax.set_title(f"② 「地图输出的物体」投回全景（{len(map_objects)} 个，★ = 物体中心，"
                  f"细线 = 地图里的 3D 包围盒）—— 星星应落在对应实物上", fontsize=9.5)
     ax.set_xticks([]); ax.set_yticks([])
 
@@ -440,7 +440,7 @@ def fig_topdown(scene: PanoScene, map_objects: Sequence[Any], out: Path,
     ax.set_xlim(-lim, lim); ax.set_ylim(-lim, lim)
     ax.grid(alpha=0.25)
     ax.set_xlabel("Δx (m)"); ax.set_ylabel("Δy (m)")
-    ax.set_title(f"同上的俯视图 + {len(ids)} 个输入视角的**光轴方向**（蓝箭头）\n"
+    ax.set_title(f"同上的俯视图 + {len(ids)} 个输入视角的「光轴方向」（蓝箭头）\n"
                  "箭头绕满一圈，说明确实是原地转一圈的多视角，而不是同一方向拍多次",
                  fontsize=9)
 
