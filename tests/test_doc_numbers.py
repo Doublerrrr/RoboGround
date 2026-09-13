@@ -77,14 +77,26 @@ def test_docs_do_not_claim_wrong_test_counts(real_counts):
     """任何文档里的"N 个测试"都必须等于真实测试数（或默认数/慢速数）。
 
     这条守的是最容易被引用、也最容易过期的数字 —— 简历和面试稿里都在写它。
+
+    ★ 两个必须绕开的坑（都是实测踩出来的）：
+    1. **形容词**：正则在"个"与"测试"之间必须允许形容词，否则
+       `421 个离线测试`、`492 个默认测试` 这类写法会**整条漏检** ——
+       实测这三处就是这么漏掉的（README 421、运行手册 492/516、WSL 指南 34）。
+    2. **单文件计数**：`pytest tests/test_video_pipeline.py -v # 30 个测试`
+       说的是**那个文件**的测试数（30），不是总数。这一行里出现了具体文件路径，
+       所以交给 `test_per_file_test_counts_in_docs_match_reality` 判，
+       本函数**跳过**这种行，否则会把合法的单文件计数误报成"总数不对"。
     """
     allowed = {real_counts["total"], real_counts["default"], real_counts["slow"]}
+    file_ref = re.compile(r"tests[\\/][\w\\/]+\.py")
     offenders = []
     for f in DOC_FILES:
         if not f.exists():
             continue
         for i, line in enumerate(f.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
-            for num in re.findall(r"(\d{2,4})\s*个测试", line):
+            if file_ref.search(line):
+                continue                      # 单文件计数：由另一条测试负责
+            for num in re.findall(r"(\d{2,4})\s*个[^，。、\s]{0,6}测试", line):
                 n = int(num)
                 if n > 100 and n not in allowed:
                     offenders.append(f"{f.relative_to(ROOT)}:{i} 写了「{num} 个测试」，"
@@ -248,3 +260,58 @@ def test_docs_global_counts_match_reality():
 
     assert not offenders, "跨文档的全局计数与实际不符：\n" + "\n".join(
         f"  {o}" for o in dict.fromkeys(offenders)) + FIX_HINT
+
+
+def _collect_per_file() -> dict:
+    """每个测试文件各有多少个测试（一次 collect 拿全，避免逐个起进程）。"""
+    cmd = [sys.executable, "-m", "pytest", "--collect-only", "-q",
+           "--no-header", "-p", "no:cacheprovider", "-o", "addopts="]
+    out = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
+    text = out.stdout + out.stderr
+    counts: dict = {}
+    for m in re.finditer(r"(tests[\\/][\w\\/]+\.py)::", text):
+        key = m.group(1).replace("\\", "/")
+        counts[key] = counts.get(key, 0) + 1
+    assert counts, f"数不出每个文件的测试数，pytest 输出：\n{text[-800:]}"
+    return counts
+
+
+def test_per_file_test_counts_in_docs_match_reality():
+    """★ 文档里「`tests/test_X.py` 的 N 个测试」必须等于该文件的实际测试数。
+
+    为什么单列一条：总测试数的检查（`test_docs_do_not_claim_wrong_test_counts`）
+    用的正则是 `(\\d+)\\s*个测试`，**要求"个"与"测试"紧邻** ——
+    于是 `421 个离线测试`、`34 个离线测试` 这类带形容词的写法全部漏检。
+    实测就漏了三处：README 写 421（实际 493）、运行手册写 492/516（实际 493/517）、
+    WSL 指南把 `test_ros2_pose.py` 写成 34（实际 46，而同项目 AGENTS.md 写的 46 是对的
+    —— 同一个数字在两个文件里不一致，本身就是信号）。
+    """
+    real = _collect_per_file()
+    offenders = []
+    # 允许「N 个[形容词]测试」，形容词限 6 个字以内且不含标点
+    pat = re.compile(r"(tests[\\/][\w\\/]+\.py)[^\n]{0,40}?(\d{2,4})\s*个([^，。、\s]{0,6})测试")
+    # ★ 表示"子集"的限定词必须排除：`test_deployment.py 里有 10 个**相关**测试`
+    #   说的是"与这一节主题相关的 10 个"，不是该文件的总数（实际 28）。
+    #   第一版没排除，直接产生了一条假告警。
+    subset_words = ("相关", "其中", "这类", "此类", "那些", "上述", "涉及", "部分")
+    for f in DOC_FILES:
+        if not f.exists():
+            continue
+        text = f.read_text(encoding="utf-8", errors="replace")
+        for i, line in enumerate(text.splitlines(), 1):
+            for m in pat.finditer(line):
+                if any(w in m.group(3) for w in subset_words):
+                    continue
+                key = m.group(1).replace("\\", "/")
+                # 文档里可能省略 `tests/` 前缀之外的部分，做一次后缀匹配
+                hits = [k for k in real if k == key or k.endswith("/" + key.split("/")[-1])
+                        or k.split("/")[-1] == key.split("/")[-1]]
+                if not hits:
+                    continue
+                exp = real[hits[0]]
+                got = int(m.group(2))
+                if got != exp:
+                    offenders.append(
+                        f"{f.relative_to(ROOT)}:{i} 说 {key} 有 {got} 个测试，实际 {exp}")
+    assert not offenders, "文档里的单文件测试数与实际不符：\n" + "\n".join(
+        f"  {o}" for o in offenders) + FIX_HINT

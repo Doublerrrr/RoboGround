@@ -93,7 +93,7 @@ conda 环境 `ros2b`（位于 `G:\minigore\envs\ros2b`）：
 | `tf2_ros` 的 TF 查询 | ❌ 见下 |
 
 **`tf2_ros` 在 Windows 上没有构建**，所以：
-- TF 路径的**数学**由 `tests/test_ros2_pose.py` 的 34 个离线测试覆盖
+- TF 路径的**数学**由 `tests/test_ros2_pose.py` 的 46 个离线测试覆盖
   （包括"光学轴纠正矩阵转置"那个真 bug）；
 - TF 路径的**rclpy 集成**需要 WSL/Linux —— 见下节。
 
