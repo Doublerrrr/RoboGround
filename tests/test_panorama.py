@@ -39,7 +39,7 @@ def _intrinsics(fov_deg: float = 60.0, size: int = 64) -> CameraIntrinsics:
 
 def _look_at(eye, target, up=(0.0, 0.0, 1.0)) -> CameraPose:
     """构造 world→camera 位姿（相机在 eye，看向 target）。"""
-    from roboground.data.virtual_camera import look_at_pose  # 复用已验证的实现
+    from roboground.geometry.camera import look_at_pose
 
     return look_at_pose(eye, target, world_up=up)
 
@@ -192,7 +192,7 @@ def test_depth_fusion_rejects_outlier_view():
     b = _uniform_view(250, 5.0, pose_b, K, frame_id="far")
 
     pano = fuse_to_equirect([a, b], width=W, height=H, min_cos=0.3,
-                            depth_outlier_m=0.5)
+                            range_outlier_m=0.5)
     # 找光轴附近的有效像素
     u, v, _ = directions_to_equirect(
         view_rays_world(a)[0], W, H)
@@ -203,6 +203,146 @@ def test_depth_fusion_rejects_outlier_view():
     # 允许在 2.0 与 5.0 之间二选一（谁权重高谁赢不算错），
     # 但**绝不能**落在中间地带
     assert d < 2.4 or d > 4.6, f"深度被平均成了 {d:.2f} m（几何上不存在的值）"
+
+
+# ==========================================================================
+# 3b) ★ 斜距 vs z 深度：一个曾经真实存在的语义错误
+# ==========================================================================
+def test_prepare_view_converts_z_depth_to_range():
+    """★ 融合用的必须是**斜距**，不是原始 z 深度。
+
+    为什么这条测试重要：上面所有深度融合的测试都取**光轴附近**的像素，
+    而在光轴上 `r == z` —— 所以它们**根本区分不出**两种语义。
+    早期版本直接把 z 深度灌进融合，这些测试全绿，但大角度上是错的。
+
+    构造：正对相机的平面（z ≡ 2 m，一个 fronto-parallel 平面）。
+    · 光轴像素：斜距 = 2 m；
+    · 边缘像素：斜距 = 2 / cos θ > 2 m（θ = 该像素与光轴的夹角）。
+    断言边缘像素的斜距**明显大于 2**，且等于 2/cos θ。
+    """
+    from roboground.data.panorama import _prepare_view
+
+    K = _intrinsics(fov_deg=90.0, size=128)
+    pose = _look_at((0, 0, 1.2), (1, 0, 1.2))
+    view = _uniform_view(128, 2.0, pose, K)
+
+    prep = _prepare_view(view, W, H, weight_power=2.0, min_cos=0.0, max_depth=8.0)
+    assert prep is not None
+    _pix, _wf, _color, rng = prep
+    rng = rng.reshape(K.height, K.width)
+
+    # ★ 注意 `cx = (size-1)/2 = 63.5` 正好落在**像素边界**上：
+    #   索引 63 的像素中心是 63.5，才是真正在光轴上的那个像素
+    #   （用 `size//2 = 64` 会差半像素，得 2.00049 而不是 2.0）。
+    ci = int(round(K.cx - 0.5))
+    u_axis = ci + 0.5
+    assert u_axis == K.cx, "取的像素中心应正好等于 cx"
+    assert rng[ci, ci] == pytest.approx(2.0, abs=1e-9), "光轴上斜距应等于 z 深度"
+
+    # 其它像素：期望值直接由约定算出来 —— r = z · |k|，k = [(u−cx)/fx, (v−cy)/fy, 1]
+    for (r_i, c_i) in ((0, 0), (0, K.width - 1), (K.height - 1, 0), (10, 90)):
+        k = np.array([(c_i + 0.5 - K.cx) / K.fx, (r_i + 0.5 - K.cy) / K.fy, 1.0])
+        expected = 2.0 * float(np.linalg.norm(k))
+        got = float(rng[r_i, c_i])
+        assert got == pytest.approx(expected, rel=1e-6), (
+            f"像素({r_i},{c_i}) 斜距应为 {expected:.6f} m，实测 {got:.6f} m")
+        assert expected > 2.0 + 1e-9, "该像素必须离轴，否则测试没有区分力"
+
+    # 最极端的一条：角落像素的斜距必须**明显**大于 2（旧实现会在这里给 2）
+    assert float(rng[0, 0]) > 3.0, (
+        f"角落像素输出 {rng[0, 0]:.4f} m —— 若接近 2.0 说明**还在用 z 深度**，"
+        "跨视角融合会把大角度上的正确观测误判为离群")
+
+
+def test_panorama_depth_is_range_not_z():
+    """融合结果里，离轴像素的斜距必须大于 2 m（正对它的平面距离）。
+
+    ⚠️ 这里**不能用固定像素**做断言：源图 128 px 覆盖 90°（0.70°/px），
+    而 2048 宽的全景是 0.176°/px —— 全景被**过采样** 4 倍，
+    大部分全景像素本来就取不到样本。所以改成对**所有有覆盖的像素**校验。
+    """
+    K = _intrinsics(fov_deg=90.0, size=128)
+    pose = _look_at((0, 0, 1.2), (1, 0, 1.2))
+    Wp, Hp = 512, 256                      # 与源图采样率相当，避免大量空洞
+    pano = fuse_to_equirect([_uniform_view(128, 2.0, pose, K)],
+                            width=Wp, height=Hp, min_cos=0.1, max_depth=8.0)
+    assert pano.is_range_image
+
+    rows, cols = np.nonzero(pano.depth_m > 0)
+    assert rows.size > 1000, f"有效像素太少（{rows.size}），测试没有区分力"
+    r = pano.depth_m[rows, cols].astype(np.float64)
+
+    # 期望值直接由等距柱状约定算出：光轴指向 +x（az=0, el=0），
+    # 所以该像素方向的离轴角 θ 满足 cos θ = cos(el)·cos(az)，而 r = 2 / cos θ
+    az = (cols + 0.5) / Wp * 2.0 * np.pi - np.pi
+    el = np.pi / 2.0 - (rows + 0.5) / Hp * np.pi
+    cos_t = np.cos(el) * np.cos(az)
+    expected = 2.0 / np.maximum(cos_t, 1e-9)
+    rel = np.abs(r - expected) / expected
+
+    assert np.median(rel) < 0.02, (
+        f"斜距与期望值中位相对误差 {np.median(rel):.4%}，说明存的不是斜距")
+    # 关键区分力：必须有大量像素的斜距**明显大于** 2 m。
+    # 旧实现（存 z 深度）会把它们全部写成 2.0。
+    n_beyond = int((r > 2.1).sum())
+    assert n_beyond > 0.2 * r.size, (
+        f"只有 {n_beyond}/{r.size} 个像素斜距 > 2.1 m —— "
+        "若几乎全为 2.0 说明**还在用 z 深度**，跨视角融合会把大角度观测误判为离群")
+    assert r.max() > 2.4, f"最大斜距仅 {r.max():.4f} m，离轴像素没有被正确换算"
+
+
+def test_equirect_backprojection_reconstructs_the_true_plane():
+    """★ 端到端：融合出的全景必须能**精确**反投影回真实平面。
+
+    这是整条链路的关键正确性断言。构造一个正对相机的平面（世界系 x = C_x + 2），
+    把 N 个视角融合成全景，再用几何层的反投影把全景像素送回三维 ——
+    **所有点都应落在那张平面上**。
+
+    如果退回"z 深度 + 等效针孔"的老做法，远离光轴的像素会系统性偏离平面，
+    这个断言会直接失败。
+    """
+    from roboground.geometry.projection import pixel_grid, unproject_pixels
+
+    K = _intrinsics(fov_deg=110.0, size=96)
+    C = np.array([0.0, 0.0, 1.2])
+    # 4 个视角，绕一圈，都看到同一张平面 x = 2（正对第一个视角）
+    frames = []
+    for az_deg in (0, 90, 180, 270):
+        a = np.radians(az_deg)
+        frames.append(_uniform_view(
+            128, 2.0, _look_at(tuple(C), (C[0] + np.cos(a), C[1] + np.sin(a), C[2])),
+            K, frame_id=f"v{az_deg}"))
+    pano = fuse_to_equirect(frames, width=512, height=256, min_cos=0.0,
+                            max_depth=8.0)
+
+    frame = frame_for_panorama(pano)
+    assert frame.meta["projection"] == "equirect"
+    # 光心必须回到 C
+    assert np.allclose(np.asarray(frame.pose.camera_center()), C, atol=1e-9)
+
+    valid = pano.depth_m > 0
+    assert valid.any()
+    uv = pixel_grid(512, 256, flatten=True)[valid.reshape(-1)]
+    r = pano.depth_m.reshape(-1)[valid.reshape(-1)]
+    pts = unproject_pixels(frame, uv, r)
+    assert pts.shape[0] > 1000
+
+    # 每个视角各看一张"朝向自己"的平面，所以世界系里并不是同一张平面；
+    # 这里逐个视角验证：把点按方位角分到 4 个象限，各自应落在对应的平面上。
+    # 视角 az 看到的是平面 {x·cos(az) + y·sin(az) = 2}（沿该方向距 C 2 m）。
+    ang = np.arctan2(pts[:, 1] - C[1], pts[:, 0] - C[0])
+    quad = ((np.degrees(ang) + 45.0) % 360.0 // 90.0).astype(int)      # 0..3
+    for q, az_deg in enumerate((0, 90, 180, 270)):
+        sel = quad == q
+        if sel.sum() < 50:
+            continue
+        a = np.radians(az_deg)
+        # 平面法向 (cos a, sin a, 0)，过点 C + 2·(cos a, sin a, 0)
+        n = np.array([np.cos(a), np.sin(a), 0.0])
+        d = float(n @ (C + 2.0 * np.array([np.cos(a), np.sin(a), 0.0])))
+        resid = np.abs(pts[sel] @ n - d)
+        assert np.median(resid) < 0.01, (
+            f"方位 {az_deg}° 的重建点偏离真实平面中位 {np.median(resid):.4f} m")
 
 
 def test_weighted_rgb_fusion_prefers_center_view():
@@ -301,6 +441,15 @@ def test_panorama_describe_has_expected_keys():
     pose = _look_at((0, 0, 1.2), (1, 0, 1.2))
     pano = fuse_to_equirect([_uniform_view(120, 2.0, pose, K)], width=W, height=H)
     d = pano.describe()
-    for k in ("分辨率", "参与视角", "有效视角", "深度覆盖", "RGB覆盖"):
+    # ★ 键名必须同时包含「像素覆盖」和「立体角覆盖」。
+    #   只报像素覆盖率会**低估**真实视野覆盖（等距柱状图里每行跨同样的仰角
+    #   增量，但赤道附近的行承载的立体角更大），实测 office_6 差 19 个百分点
+    #   （像素 52.2% vs 立体角 71.4%）。所以两个都得有，缺一个就是退步。
+    for k in ("分辨率", "参与视角", "有效视角", "像素覆盖", "立体角覆盖",
+              "仰角范围", "RGB覆盖"):
         assert k in d, f"describe() 缺少 {k}"
+    # 统计口径也必须自报家门
+    assert pano.meta["depth_semantics"] == "range_from_center", \
+        "全景的 depth_m 是斜距，必须在 meta 里写明，否则下游会当成针孔 z 深度用"
     assert isinstance(pano, Panorama)
+    assert pano.range_m is pano.depth_m or np.array_equal(pano.range_m, pano.depth_m)

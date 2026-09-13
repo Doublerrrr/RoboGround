@@ -1,20 +1,23 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""03 · 用真实数据建图（SUN RGB-D 单场景 / 虚拟相机多视角）。
+"""03 · 用真实数据建图（SUN RGB-D 单场景）。
 
-两条数据路径
------------
-1. `--source sunrgbd`：用 SUN RGB-D 的**真实单帧** RGB-D 建图（一张图一个视角）；
-2. `--source virtual`：把 SUN RGB-D 场景的点云用**虚拟相机**重渲染成多视角序列，
-   用来验证"多视角融合"这条链路（因为原始数据每个场景只有一帧）。
+数据路径
+-------
+用 SUN RGB-D 的**真实单帧** RGB-D 建图（一张图一个视角）。
+SUN RGB-D 每个场景只有一帧，所以这里天然是单视角。
+
+⚠️ 已删除 `--source virtual`：那是把点云用"虚拟相机"重渲染成多视角序列，
+是**同一份观测的重采样**，信息量不增加 —— 实测无效深度像素从 42.8%
+涨到 77.0%（见 `docs/多视角数据核查报告.md`）。
+真正做"多视角 → 一张全景融合"的是 2D-3D-S（一个采集点有 31~72 个
+**真实**视角）：
+    python scripts/37_eval_pano_grounding.py --rooms office_6 hallway_6
 
 用法::
 
     # 真实单帧建图（挑一个物体多的场景）
     python scripts/03_build_map.py --source sunrgbd --save runs/map_sunrgbd.npz
-
-    # 虚拟相机多视角（6 个视角，绕场景中心环绕）
-    python scripts/03_build_map.py --source virtual --views 6 --save runs/map_virtual.npz
 
     # 指定 prompts（开放词汇的核心：换 prompt 就换"要找什么"）
     python scripts/03_build_map.py --prompts chair table monitor door window
@@ -36,7 +39,6 @@ from roboground.data.sunrgbd import (                                 # noqa: E4
     load_scene_index,
     load_sunrgbd_scene,
 )
-from roboground.data.virtual_camera import scene_sequence_from_cloud  # noqa: E402
 from roboground.mapping import MapBuilder                             # noqa: E402
 from roboground.reasoning import RuleEngine                           # noqa: E402
 from roboground.utils.logging import get_logger                       # noqa: E402
@@ -70,11 +72,9 @@ def pick_scene(index, *, min_boxes: int = 5, min_classes: int = 3,
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--source", choices=["sunrgbd", "virtual"], default="sunrgbd")
+    ap.add_argument("--source", choices=["sunrgbd"], default="sunrgbd")
     ap.add_argument("--index", default=None, help="场景索引路径")
     ap.add_argument("--scene", type=int, default=None, help="指定场景下标（默认自动挑）")
-    ap.add_argument("--views", type=int, default=6, help="虚拟相机的视角数（仅 virtual）")
-    ap.add_argument("--radius", type=float, default=1.8, help="虚拟相机环绕半径（米）")
     ap.add_argument("--resize", type=int, default=480, help="长边缩放到该尺寸（加速）")
     ap.add_argument("--prompts", nargs="*", default=None)
     ap.add_argument("--voxel-size", type=float, default=None, help="覆盖体素边长（米）")
@@ -127,15 +127,13 @@ def main() -> int:
              f"{int((scene.depth_m > 0).sum())} px")
     log.info(f"  GT 类别：{sorted(set(scene.labels))}")
 
-    # ---------------- 造帧序列 ----------------
-    if args.source == "virtual":
-        log.info(f"用虚拟相机生成 {args.views} 个视角（半径 {args.radius} m）")
-        frames = scene_sequence_from_cloud(
-            scene, num_frames=args.views, radius=args.radius,
-            max_points=120_000, splat=2,
-        )
-    else:
-        frames = [scene.to_frame()]
+    # ---------------- 取帧 ----------------
+    # ⚠️ 已删除 `--source virtual`（点云 splatting 造 N 个**假**视点）。
+    #    那种做法是同一份观测的重采样，信息量不增加：实测无效深度像素
+    #    从 42.8% 涨到 77.0%（见 docs/多视角数据核查报告.md）。
+    #    真实"多视角 → 一张全景"的融合见 src/roboground/data/panorama.py，
+    #    端到端入口 scripts/37_eval_pano_grounding.py。
+    frames = [scene.to_frame()]
 
     # ---------------- 建图 ----------------
     log.info(f"建图：{len(frames)} 帧")

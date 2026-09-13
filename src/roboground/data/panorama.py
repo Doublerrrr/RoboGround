@@ -51,20 +51,82 @@ logger = get_logger("data.panorama")
 # ==========================================================================
 @dataclass
 class Panorama:
-    """一张融合出来的等距柱状全景（RGB + 深度 + 覆盖统计）。"""
+    """一张融合出来的等距柱状全景（RGB + 深度 + 覆盖统计）。
+
+    ★★ `depth_m` 对全景而言是**斜距（range）**，不是针孔 z 深度 ★★
+    ------------------------------------------------------------
+    这一点必须说清楚，否则下游反投影会系统性出错。
+
+    · 针孔相机的 `depth_m` = 沿光轴的 **z 分量**（所以 `p_cam = z·k`）；
+    · 全景的 `depth_m` = 从**光心 C 到表面点的欧氏距离** `r`。
+
+    为什么必须换：一个采集点上的 N 个视角**共享同一个光心 C**
+    （实测离散度 1.95e-06 m），所以对**同一个表面点**，各视角测到的
+    **z 深度互不相同**（比值 = `cos θ_ref / cos θ_i`，在 `min_cos=0.35`
+    的允许范围内最大可达 **2.86 倍**），而**斜距 r 是同一个物理量**。
+    用 z 深度跨视角做"共识融合"，会把大角度上的正确观测当成离群点剔掉。
+
+    已实测确认 2D-3D-S 的原始深度是 **z 深度**（不是斜距）：
+    RANSAC 平面拟合在 8/8 个采集点上，z 假设的内点数（13k~30k @ 1 cm）
+    都是斜距假设（4k~9k）的 2~3 倍。
+
+    因此**正确的反投影**是 `p_world = C + r · d_world(u, v)`，
+    其中 `d_world` 由 `panorama_rays_world()` 给出（精确等距柱状方向）。
+    **不能**用等效针孔内参去做反投影 —— 那只在小角度下近似成立。
+    """
 
     rgb: np.ndarray                      # (H, W, 3) uint8
-    depth_m: np.ndarray                  # (H, W) float32，0 表示无效
+    depth_m: np.ndarray                  # (H, W) float32：**斜距 r（米）**，0 表示无效
     weight: np.ndarray                   # (H, W) float32：该像素累计权重（0 = 无覆盖）
     n_views: int = 0                     # 参与融合的视角数
     n_used: int = 0                      # 真正有像素落进来的视角数
     meta: Dict[str, Any] = field(default_factory=dict)
+    center: Optional[np.ndarray] = None  # 光心 C（世界系）；N 个视角共享
 
     # ---------------- 统计 ----------------
     @property
+    def range_m(self) -> np.ndarray:
+        """语义明确的别名：`depth_m` 在全景里就是**斜距**。"""
+        return self.depth_m
+
+    @property
+    def is_range_image(self) -> bool:
+        return True
+
+    @property
     def coverage(self) -> float:
-        """有有效深度的像素占比。"""
+        """有有效深度的像素占比。
+
+        ⚠️ 这是**像素**占比，不是立体角占比。等距柱状图里每行跨同样的
+        仰角增量，所以赤道附近的行承载的立体角**更大** ——
+        只报告像素占比会**低估**实际覆盖（实测 office_6：像素 52%，
+        立体角 71%）。要对外说"覆盖了多少视野"，用 `solid_angle_coverage`。
+        """
         return float((self.depth_m > 0).mean())
+
+    @property
+    def solid_angle_coverage(self) -> float:
+        """有有效深度的**立体角**占比（更如实）。
+
+        等距柱状图上一行的立体角权重是 `cos(el)`：`dΩ = cos(el)·del·daz`。
+        """
+        H = self.depth_m.shape[0]
+        el = np.pi / 2.0 - (np.arange(H, dtype=np.float64) + 0.5) / H * np.pi
+        w = np.cos(el)[:, None]
+        wsum = float(np.broadcast_to(w, self.depth_m.shape).sum())
+        if wsum <= 0:
+            return 0.0
+        got = float((w * (self.depth_m > 0)).sum())
+        return got / wsum
+
+    def elevation_span_deg(self) -> Tuple[float, float]:
+        """有覆盖的像素所占的仰角范围（度），用于如实描述"垂直看到多少"。"""
+        H = self.depth_m.shape[0]
+        rows = np.flatnonzero((self.depth_m > 0).any(axis=1))
+        if rows.size == 0:
+            return (0.0, 0.0)
+        el = lambda v: 90.0 - (v + 0.5) / H * 180.0        # noqa: E731
+        return (float(el(rows.max())), float(el(rows.min())))
 
     @property
     def rgb_coverage(self) -> float:
@@ -72,11 +134,14 @@ class Panorama:
         return float((self.weight > 0).mean())
 
     def describe(self) -> Dict[str, Any]:
+        el_lo, el_hi = self.elevation_span_deg()
         return {
             "分辨率": f"{self.rgb.shape[1]}x{self.rgb.shape[0]}",
             "参与视角": self.n_views,
             "有效视角": self.n_used,
-            "深度覆盖": f"{self.coverage * 100:.1f}%",
+            "像素覆盖": f"{self.coverage * 100:.1f}%",
+            "立体角覆盖": f"{self.solid_angle_coverage * 100:.1f}%",
+            "仰角范围": f"{el_lo:+.1f}° ~ {el_hi:+.1f}°",
             "RGB覆盖": f"{self.rgb_coverage * 100:.1f}%",
             **self.meta,
         }
@@ -161,7 +226,17 @@ def _prepare_view(frame, W: int, H: int, *, weight_power: float, min_cos: float,
                   max_depth: float):
     """把一帧整理成融合需要的扁平数组；没有可用像素时返回 None。
 
-    返回 `(pix, wf, color_flat, depth_flat)`，都是**一维**（长度 = 该帧像素数）。
+    返回 `(pix, wf, color_flat, range_flat)`，都是**一维**（长度 = 该帧像素数）。
+
+    ★ 关键的最后一列是**斜距**而不是原始 z 深度。理由见 `Panorama` 的文档：
+    同一光心上的多个视角，对同一个表面点测到的 z 深度互不相同
+    （最多差 2.86 倍），只有斜距才是**跨视角可比**的物理量。
+    换算只用位姿旋转，不需要内参：
+
+        `p_cam = z · k`（`k_z = 1`） → `d_cam = k / |k|` → `d_cam.z = 1 / |k|`
+        → `r = |p_cam| = z · |k| = z / d_cam.z`
+
+    这里 `d_cam.z` 可以由 `d_cam = R @ d_world` 直接取出（`d_world` 已归一化）。
     """
     depth = np.asarray(frame.depth_m, dtype=np.float64)
     color = np.asarray(frame.color)
@@ -180,11 +255,26 @@ def _prepare_view(frame, W: int, H: int, *, weight_power: float, min_cos: float,
     if not w.any():
         return None
 
+    # z 深度 → 斜距：d_cam = R @ d_world（都是单位向量），取 z 分量
+    R = np.asarray(frame.pose.R, dtype=np.float64).reshape(3, 3)
+    d_cam_z = (dirs @ R.T)[..., 2]           # (R @ d).z 展开成 d @ R.T
+    # 光轴方向 d_cam_z = 1 → r = z；越靠边缘 d_cam_z 越小 → r 越大
+    z_ok = d_cam_z > 1e-6
+    rng_flat = np.where(z_ok, depth / np.maximum(d_cam_z, 1e-12), 0.0)
+    # ★ 门限必须作用在**斜距**上，不能只作用于 z 深度：
+    #   若只筛 z，边缘像素（d_cam_z 可低至 0.35）换算后会得到
+    #   8 / 0.35 ≈ 22.9 m 的斜距，"max_depth=8 m"就名不副实了。
+    #   （实测最初就出现了这个问题：设了 8 m 却融合出 9.91 m 的深度。）
+    r_ok = z_ok & (rng_flat <= float(max_depth)) & (rng_flat > 0)
+    w = w * r_ok
+    if not w.any():
+        return None
+
     u, v, _el = directions_to_equirect(dirs, W, H)
     pix = (v.ravel() * W + u.ravel()).astype(np.int64)
     return (pix, w.ravel(),
             color.reshape(-1, 3).astype(np.float64),
-            depth.ravel())
+            rng_flat.ravel())
 
 
 def fuse_to_equirect(
@@ -195,7 +285,7 @@ def fuse_to_equirect(
     weight_power: float = 2.0,
     min_cos: float = 0.35,
     max_depth: float = 8.0,
-    depth_outlier_m: float = 0.5,
+    range_outlier_m: float = 0.5,
     rgb_mode: str = "weighted_mean",
 ) -> Panorama:
     """把 N 个**真实**视角融合成一张等距柱状全景。
@@ -204,6 +294,8 @@ def fuse_to_equirect(
     ----------
     frames
         若干 `RGBDFrame`（各自带内参与位姿）。**顺序无关**。
+        它们必须**共享同一个光心**（同一个采集点）—— 这是"能融合成一张
+        全景"的前提，函数会校验并在不一致时告警。
     width, height
         全景分辨率（宽 : 高 = 2 : 1 是等距柱状的标准比例）。
     weight_power
@@ -211,28 +303,39 @@ def fuse_to_equirect(
     min_cos
         低于该余弦的像素丢弃（默认 0.35 ≈ 离光轴 69.5°）。
     max_depth
-        超过该深度（米）的点视为不可靠，丢弃。
-    depth_outlier_m
-        两遍融合的离群阈值：第一遍算加权均值，第二遍丢掉偏离超过该值的样本
-        （同一个全景像素可能被前景/背景同时覆盖，不剔除会把深度拉成"平均"）。
+        超过该**斜距**（米）的点视为不可靠，丢弃。
+    range_outlier_m
+        共识融合的**斜距**容差：丢掉与基准样本相差超过该值的观测。
+        ⚠️ 早期版本这里比的是 z 深度，那是错的 —— 跨视角比 z 深度会把
+        大角度上的正确观测误判为离群（详见 `Panorama` 的文档）。
     rgb_mode
         `weighted_mean`（默认，抗噪）或 `nearest`（取权重最高的样本，最锐利）。
 
     Returns
     -------
-    `Panorama`
+    `Panorama`（`depth_m` 是**斜距**，光心记在 `center`）
     """
     if rgb_mode not in ("weighted_mean", "nearest"):
         raise ValueError(f"rgb_mode 只支持 weighted_mean / nearest，收到 {rgb_mode!r}")
     if not frames:
         raise ValueError("frames 为空，没有可融合的视角")
 
+    # ---- 校验：所有视角必须共享同一个光心（否则不是"原地转一圈"）----
+    centers = np.array([np.asarray(f.pose.camera_center(), dtype=np.float64)
+                        for f in frames])
+    center = centers.mean(axis=0)
+    spread = float(np.max(np.linalg.norm(centers - center, axis=1)))
+    if spread > 0.05:
+        logger.warn(
+            f"多视角融合的光心不一致：最大离散 {spread:.4f} m > 0.05 m。"
+            "这些视角可能不在同一个采集点上，融合结果会糊/重影。")
+
     H, W = int(height), int(width)
     rgb_sum = np.zeros((H, W, 3), dtype=np.float64)
     w_sum = np.zeros((H, W), dtype=np.float64)
     best_w = np.zeros((H, W), dtype=np.float64)
     best_rgb = np.zeros((H, W, 3), dtype=np.float64)
-    best_d = np.zeros((H, W), dtype=np.float64)
+    best_r = np.zeros((H, W), dtype=np.float64)
     n_used = 0
 
     for fi, frame in enumerate(frames):
@@ -241,7 +344,7 @@ def fuse_to_equirect(
         if prep is None:
             logger.warn(f"第 {fi} 帧没有可用像素（权重门限 / 深度），跳过")
             continue
-        pix, wf, color_flat, depth_flat = prep
+        pix, wf, color_flat, range_flat = prep
 
         # ---- 累加（用 np.bincount 做逐像素归约，比 add.at 快得多）----
         for c in range(3):
@@ -255,7 +358,7 @@ def fuse_to_equirect(
         if win.any():
             bp = pix[win]
             best_rgb.reshape(-1, 3)[bp] = color_flat[win]
-            best_d.reshape(-1)[bp] = depth_flat[win]
+            best_r.reshape(-1)[bp] = range_flat[win]
         n_used += 1
 
     # ---- RGB ----
@@ -266,7 +369,7 @@ def fuse_to_equirect(
     else:
         rgb[has] = np.clip(rgb_sum[has] / w_sum[has][:, None], 0, 255).astype(np.uint8)
 
-    # ---- 深度：以"权重最高的真实样本"为基准 + 共识融合 ----
+    # ---- 斜距：以"权重最高的真实样本"为基准 + 共识融合 ----
     #
     # 为什么不用"先均值再剔离群"（我第一版就是这么写的，被测试抓出来了）：
     # 同一个全景像素被**前景 2 m 与背景 5 m** 同时覆盖时，加权均值是 3.5 m，
@@ -277,56 +380,71 @@ def fuse_to_equirect(
     # 最可靠的那个观测），再只融合与它一致的样本。这样：
     #   · 绝不会在两张不相连的表面上取平均；
     #   · 仍然能靠多视角平均降噪（一致的那些样本会被融合）。
-    depth_out = np.zeros((H, W), dtype=np.float32)
+    range_out = np.zeros((H, W), dtype=np.float32)
     if (w_sum > 0).any():
-        # 基准 = 权重最高的样本（best_d 在累加阶段已按权重选出）
-        ref = best_d.reshape(-1)
-        d2_sum = np.zeros(H * W)
-        d2_w = np.zeros(H * W)
+        # 基准 = 权重最高的样本（best_r 在累加阶段已按权重选出）
+        ref = best_r.reshape(-1)
+        r2_sum = np.zeros(H * W)
+        r2_w = np.zeros(H * W)
         for frame in frames:
             prep = _prepare_view(frame, W, H, weight_power=weight_power,
                                  min_cos=min_cos, max_depth=max_depth)
             if prep is None:
                 continue
-            pix, wf, _color_flat, depth_flat = prep
-            agree = np.abs(depth_flat - ref[pix]) <= float(depth_outlier_m)
+            pix, wf, _color_flat, range_flat = prep
+            agree = np.abs(range_flat - ref[pix]) <= float(range_outlier_m)
             wf2 = np.where(agree, wf, 0.0)
-            d2_sum += np.bincount(pix, weights=(wf2 * depth_flat), minlength=H * W)[: H * W]
-            d2_w += np.bincount(pix, weights=wf2, minlength=H * W)[: H * W]
-        good = d2_w > 0
-        depth_out.reshape(-1)[good] = (d2_sum[good] / d2_w[good]).astype(np.float32)
+            r2_sum += np.bincount(pix, weights=(wf2 * range_flat), minlength=H * W)[: H * W]
+            r2_w += np.bincount(pix, weights=wf2, minlength=H * W)[: H * W]
+        good = r2_w > 0
+        range_out.reshape(-1)[good] = (r2_sum[good] / r2_w[good]).astype(np.float32)
         # 只有基准、没有别的样本与它一致时，就用基准本身（它是个真实观测）
         solo = (~good) & (best_w.reshape(-1) > 0)
-        depth_out.reshape(-1)[solo] = ref[solo].astype(np.float32)
+        range_out.reshape(-1)[solo] = ref[solo].astype(np.float32)
 
-    return Panorama(rgb=rgb, depth_m=depth_out, weight=w_sum.astype(np.float32),
-                    n_views=len(frames), n_used=n_used,
+    return Panorama(rgb=rgb, depth_m=range_out, weight=w_sum.astype(np.float32),
+                    n_views=len(frames), n_used=n_used, center=center,
                     meta={"weight_power": weight_power, "min_cos": min_cos,
                           "max_depth": max_depth, "rgb_mode": rgb_mode,
-                          "depth_outlier_m": depth_outlier_m})
+                          "range_outlier_m": range_outlier_m,
+                          "center_spread_m": spread,
+                          "depth_semantics": "range_from_center"})
 
 
 def frame_for_panorama(pano: Panorama, *, frame_id: str = "panorama", pose=None):
-    """把全景包成一个 `RGBDFrame`（内参按等距柱状的像素-角度关系构造）。
+    """把全景包成一个 `RGBDFrame`，让下游 `MapBuilder` **不需要改动**就能消费。
 
-    这样下游 `MapBuilder` / 可视化**不需要任何改动**就能消费全景。
+    内参是"等效针孔"近似（`fx = W / 2π`、`fy = H / π`、`cx = W/2`、`cy = H/2`）。
+    它恰好让**方向**在小角度下与等距柱状一致，但整体上**不准确** ——
+    等距柱状的仰角用 `sin`、等效针孔用 `tan`，到 90° 附近会发散。
 
-    ⚠️ 等距柱状投影**不是针孔投影**，所以这里给的内参是一种
-    "等效针孔"近似（`fx = W / 2π`、`fy = H / π`、`cx = W/2`、`cy = H/2`），
-    它只对**小角度范围**准确。要用全景做精确的三维反投影，
-    应该用 `panorama_rays_world()` 直接取每个像素的世界方向（本模块提供），
-    而不是走针孔反投影。这个区别很重要，所以写在这里。
+    所以这里同时往 `meta` 里写了 `projection="equirect"` 和 `center`：
+    **几何层的反投影会据此走精确的等距柱状通路**
+    （`p_world = C + r · d_world(u, v)`），而不是用针孔近似。
+    等效内参因此只用于"粗略估计"，不参与精确重建。
+
+    `pose` 默认取 **旋转 = 单位阵、平移 = −C**：
+    于是 `pose.camera_center() = −Rᵀt = C`（真正的光心），
+    且全景相机系的轴与**世界系轴重合** —— 这与 `fuse_to_equirect`
+    按世界方位角/仰角落像素的约定完全一致。
     """
     from roboground.types import CameraIntrinsics, CameraPose, RGBDFrame
 
     H, W = pano.rgb.shape[:2]
     K = CameraIntrinsics(fx=W / (2.0 * np.pi), fy=H / np.pi,
                          cx=W / 2.0, cy=H / 2.0, width=W, height=H)
+    if pose is None:
+        C = (np.zeros(3) if pano.center is None
+             else np.asarray(pano.center, dtype=np.float64).reshape(3))
+        pose = CameraPose(R=np.eye(3), t=-C)
     return RGBDFrame(color=pano.rgb, depth_m=pano.depth_m, intrinsics=K,
-                     pose=(pose if pose is not None else CameraPose.identity()),
-                     frame_id=frame_id,
+                     pose=pose, frame_id=frame_id,
                      meta={"source": "panorama_fusion", "n_views": pano.n_views,
-                           "coverage": pano.coverage})
+                           "coverage": pano.coverage,
+                           "projection": "equirect",
+                           "depth_semantics": "range_from_center",
+                           "center": (None if pano.center is None
+                                      else np.asarray(pano.center).tolist())})
 
 
 def panorama_rays_world(pano: Panorama, pose=None) -> np.ndarray:

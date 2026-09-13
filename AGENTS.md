@@ -36,7 +36,7 @@ cd G:\RoboGround
 pip install -e ".[dev]"
 
 python scripts/00_quickstart.py        # 全离线端到端，10 秒
-pytest                                  # 461 个测试，约 12 秒
+pytest                                  # 514 个测试，约 12 秒
 python scripts/01_check_env.py         # 环境自检
 ```
 
@@ -77,7 +77,8 @@ src/roboground/
 ├── data/
 │   ├── sunrgbd.py       SUN RGB-D 加载器 + 场景索引缓存（含坐标标定说明）
 │   ├── synthetic.py     解析式射线-盒渲染（含完美 GT，测试金标准）
-│   ├── virtual_camera.py 点云 splatting 重渲染（造多视角序列）
+│   ├── panorama.py      多视角 → 一张 360° 等距柱状全景（真实视角融合）
+│   ├── pano_scene.py    2D-3D-S 采集点 → PanoScene（含 GT 3D 框）
 │   ├── auto_label.py    Stage 5：四道质量闸门 + COCO 导出 + 跨帧一致性
 │   ├── video/           ★ 单视频管线（镜头检测 / 抽帧 / 去重 / 质量）
 │   │   ├── shot.py        镜头检测（HSV 直方图 + robust 阈值 + 峰值突出度判据）
@@ -115,6 +116,8 @@ scripts/    00_quickstart ~ 24_goldset_eval（每个都能独立跑）
             17 视频管线评测 / 18 GRPO 训练 / 19 抽帧策略下游消融
             20 大规模多模态语料工程 / 21 镜头检测诊断图 / 22 镜头检测修复前后消融
             23 金种子参数扫描 / 24 金种子评测四阶段 / 25 文档数字审计（机器核对文档里的数）
+            28~33 2D-3D-S 数据集拉取 / 核验 / 解压 / 字段与 GT 检查
+            34~37 ★ 多视角全景融合链路（适配器核验 / 与官方全景对照 / 数据集统计 / 定位评测）
             _shot_legacy.py 修复前的镜头检测实现（只给 22/24 做消融复现用）
             fetch_corpus_data.py 语料下载器（HF 镜像 + 分块续传）
             wsl/ 01~05 安装脚本 + 13/42/43/44 诊断脚本
@@ -130,14 +133,16 @@ ros2_ws/    ★ 标准 ament 包（colcon build → ros2 run / ros2 launch）
               src/roboground_ros/roboground_ros/{perception_node,query_node,launch_args,tf_spec}.py
               src/roboground_ros/{launch/*.py ×3, config/roboground.yaml}
               README.md（安装 / 运行 / 参数 / TF 树 / 验证 / 诚实清单）
-tests/      461 个测试（437 默认 + 24 slow），全部通过
+tests/      514 个测试（490 默认 + 24 slow），全部通过
 docs/       技术方案 / 运行手册 / 实现笔记 / 简历要点 / 面试QA
             真实后端集成报告 / WSL_ROS2_安装指南
             视频数据管线报告 / GRPO_RLVR报告 / 面试答题稿_VLM与RL
             大规模多模态数据工程报告 / 数据卡_MSRVTT
             项目导航_模块与文档索引（想查东西先看这份） / 学习路线_从零到面试
             项目完整清单与阅读顺序（★ 第一次看项目从这里开始）
-            多视角数据核查报告（★ 一次自我纠错：多视角是重渲染，−52% 已作废）
+            多视角数据核查报告（★ 一次自我纠错：多视角是重渲染，−52% 已作废；历史记录）
+            多视角全景融合报告（★ 真实多视角 → 360° 全景，替换掉虚拟视角那条链路）
+            2D3D-S数据集核验报告（2D-3D-S 的字段、位姿与 GT 约定核验）
 ```
 
 ---
@@ -703,18 +708,25 @@ DBSCAN 会把桌上和桌边的物体粘成一个。改用**实例关联**
 
 ## 五、当前状态（迁移时点）
 
-- **S1~S5 代码全部完成**，461 个测试全部通过（437 默认 + 24 slow）。
+- **S1~S5 代码全部完成**，514 个测试全部通过（490 默认 + 24 slow）。
 - **几何层已在真实 SUN RGB-D 上验证**：
   - 场景索引：10335 场景 / 64783 GT 框
   - GT 框中心投影有效率 **90.5%**
   - 真实数据建图：172 ms/帧，14 个物体
-- **基准数字**（可复现，见 `runs/benchmark.md`）：
+- **基准数字**（可复现，见 `runs/b2.md` 与 `runs/bench_sunrgbd.json`；
+  旧的 `runs/benchmark.md` 已不在磁盘上）：
 
   | 场景 | 地图级定位中位误差 |
   |---|---|
   | 合成（多视角） | **0.218 m**（100% ≤ 0.25m） |
   | 真实单帧 | **0.381 m**（5 场景实测；旧值 0.553 无产物可复现） |
   | 6 个**渲染**视角（非真实多视角） | **0.259 m**（45.7% ≤ 0.25m） |
+
+  > ★ 第三行出自**已删除**的虚拟视角链路（`--source virtual` / `virtual_camera.py` / 脚本 26、27，
+  > 点云重渲染造视角，不增加信息 —— 见 `docs/多视角数据核查报告.md`）：
+  > 代码与产物 `runs/bench_virtual.json` **都已不在仓库里**，这一行只作历史记录、**不可复现**；
+  > 现在的多视角路线是 **2D-3D-S 真实视角 → 一张 360° 全景**
+  > （`src/roboground/data/panorama.py`，报告见 `docs/多视角全景融合报告.md`）。
 
 - **曾列为"未完成"、现已完成**（2026-09-11 复核）：
   - ~~ROS2 节点未在真实 ROS2 环境跑过~~ → **两条路径都跑通了**：
@@ -791,11 +803,16 @@ pytest -m slow                      # 真实数据测试
 pytest tests/test_geometry.py -v     # 单个模块
 
 # 建图 + 查询
-python scripts/03_build_map.py --source virtual --views 6 --save runs/map.npz
+python scripts/03_build_map.py --source sunrgbd --save runs/map.npz
 python scripts/04_query_demo.py runs/map.npz --auto
 
 # 出数字
-python scripts/05_benchmark.py --source virtual --scenes 2 --views 4 --out runs/bench_virtual.json
+python scripts/05_benchmark.py --source sunrgbd --scenes 5 --out runs/bench_sunrgbd.json
+
+# 多视角全景融合（需要 2D-3D-S 数据：G:\2d3ds\area_1\area_1）
+python scripts/36_pano_dataset_stats.py
+python scripts/35_validate_pano_vs_official.py --all --n 3
+python scripts/37_eval_pano_grounding.py --rooms office_6 hallway_6 office_27
 
 # 量化对照
 python scripts/07_export_onnx.py --skip-onnx

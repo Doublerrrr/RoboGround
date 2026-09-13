@@ -22,11 +22,13 @@
     # 真实数据（需要先建索引）
     python scripts/05_benchmark.py --source sunrgbd --scenes 10
 
-    # 真实数据 + 虚拟相机多视角
-    python scripts/05_benchmark.py --source virtual --scenes 5 --views 6
-
     # 对比不同量化模式（感知编码器的 fp16/int8）
     python scripts/05_benchmark.py --source synthetic --quantization
+
+⚠️ 已删除 `--source virtual`：那是用点云 splatting 从**一个**真实视角造
+N 个**假**视点，信息量不增加（无效深度像素 42.8% → 77.0%）。
+真实"多视角 → 一张全景"的链路由 2D-3D-S 承担，见
+`scripts/37_eval_pano_grounding.py`。
 """
 
 from __future__ import annotations
@@ -98,46 +100,6 @@ def collect_sunrgbd(args, cfg):
     return frames, gts
 
 
-def collect_virtual(args, cfg):
-    from roboground.data.sunrgbd import load_scene_index, load_sunrgbd_scene
-    from roboground.data.virtual_camera import scene_sequence_from_cloud
-
-    index_path = str(Path(str(cfg.get("data.root", "data"))) / "cache" / "sunrgbd_index.npz")
-    index = load_scene_index(index_path)
-
-    wanted = {p.lower() for p in PROMPTS}
-    counts = np.diff(np.asarray(index["box_offset"], dtype=np.int64))
-    frames, gts, used = [], [], []
-
-    for pos in np.argsort(-counts):
-        i = int(pos)
-        if len(used) >= args.scenes:
-            break
-        off0, off1 = int(index["box_offset"][i]), int(index["box_offset"][i + 1])
-        labels = {str(x).lower() for x in np.asarray(index["label_flat"][off0:off1]).ravel()}
-        if not (labels & wanted):
-            continue
-        scene = load_sunrgbd_scene(
-            index, i, max_depth=8.0,
-            resize=(args.width, args.height) if args.width and args.height else None,
-        )
-        if scene is None or scene.boxes_3d.shape[0] == 0:
-            continue
-        seq = scene_sequence_from_cloud(
-            scene, num_frames=args.views, radius=args.radius,
-            max_points=120_000, splat=2,
-        )
-        frames.extend(seq)
-        gts.extend([scene.boxes_3d] * len(seq))
-        used.append(i)
-
-    if not frames:
-        raise RuntimeError("虚拟相机没有生成任何帧")
-    log = get_logger("bench")
-    log.info(f"使用场景下标：{used}，共 {len(frames)} 帧（每场景 {args.views} 视角）")
-    return frames, gts
-
-
 def run_quantization_study(args, cfg):
     """对比感知编码器在不同量化模式下的体积/延迟（需要 torch）。"""
     import torch
@@ -186,11 +148,9 @@ def run_quantization_study(args, cfg):
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--source", choices=["synthetic", "sunrgbd", "virtual"], default="synthetic")
+    ap.add_argument("--source", choices=["synthetic", "sunrgbd"], default="synthetic")
     ap.add_argument("--frames", type=int, default=5, help="合成模式下的帧数")
     ap.add_argument("--scenes", type=int, default=5, help="真实模式下的场景数")
-    ap.add_argument("--views", type=int, default=6, help="虚拟模式下的视角数")
-    ap.add_argument("--radius", type=float, default=1.8)
     ap.add_argument("--objects", type=int, default=6, help="合成模式下的物体数")
     ap.add_argument("--width", type=int, default=320)
     ap.add_argument("--height", type=int, default=240)
@@ -210,10 +170,8 @@ def main() -> int:
     log.info(f"数据来源：{args.source}")
     if args.source == "synthetic":
         frames, gts = collect_synthetic(args, cfg)
-    elif args.source == "sunrgbd":
-        frames, gts = collect_sunrgbd(args, cfg)
     else:
-        frames, gts = collect_virtual(args, cfg)
+        frames, gts = collect_sunrgbd(args, cfg)
     log.info(f"共 {len(frames)} 帧，GT 框 {sum(len(g) for g in gts)} 个")
 
     # ---- 查询集（用地图里真实出现的类别构造，保证可评测）----

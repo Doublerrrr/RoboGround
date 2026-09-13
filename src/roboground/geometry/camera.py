@@ -123,3 +123,43 @@ def points_in_camera_frustum(
         & (uv[:, 1] <= height - 1 + margin)
     )
     return inside, uv
+
+
+def look_at_pose(
+    eye,
+    target,
+    *,
+    world_up=(0.0, 0.0, 1.0),
+) -> CameraPose:
+    """构造「站在 `eye`、看向 `target`」的相机位姿（**world → camera**）。
+
+    约定与本项目其余部分一致：`CameraPose` 存 world→camera，
+    所以返回的 `R` 满足 `p_cam = R @ p_world + t`，光心 `C = −Rᵀt = eye`。
+
+    这里用的是 OpenCV 相机系（x 右、y 下、z 前）：先定 `z_cam = target − eye`，
+    再用 `world_up` 叉乘得到 `x_cam`，最后 `y_cam = z_cam × x_cam`。
+
+    ⚠️ 这个函数原先住在 `data/virtual_camera.py`（那个模块用来"造虚拟视角"，
+    已删除）。它的用途是**构造测试与验证用的已知位姿**，属于相机几何，
+    所以搬到了 `geometry/` 下 —— 与"虚拟视角"这个概念无关。
+    """
+    eye = np.asarray(eye, dtype=np.float64).reshape(3)
+    target = np.asarray(target, dtype=np.float64).reshape(3)
+    up = np.asarray(world_up, dtype=np.float64).reshape(3)
+
+    z_cam = target - eye
+    norm = np.linalg.norm(z_cam)
+    if norm < 1e-9:
+        return CameraPose.identity()
+    z_cam = z_cam / norm
+
+    x_cam = np.cross(up, z_cam)
+    if np.linalg.norm(x_cam) < 1e-6:          # 视线与 up 平行，换一个参考轴
+        x_cam = np.cross(np.array([1.0, 0.0, 0.0]), z_cam)
+    x_cam = x_cam / max(np.linalg.norm(x_cam), 1e-9)
+    y_cam = np.cross(z_cam, x_cam)
+
+    R_cam_to_world = np.stack([x_cam, y_cam, z_cam], axis=1)
+    R = R_cam_to_world.T
+    t = -R @ eye
+    return CameraPose(R, t)

@@ -274,6 +274,74 @@ def _mask_from_bbox(bbox: np.ndarray, height: int, width: int) -> np.ndarray:
     return mask
 
 
+def pixel_directions_camera(frame: RGBDFrame,
+                            uv: np.ndarray) -> np.ndarray:
+    """给定像素坐标，返回**相机系单位方向**（自动识别投影模型）。
+
+    支持两种模型，由 `frame.meta["projection"]` 决定：
+
+    · `"pinhole"`（默认）：`d ∝ [(u−cx)/fx, (v−cy)/fy, 1]`；
+    · `"equirect"`：等距柱状全景，`az = (u+0.5)/W·2π − π`、
+      `el = π/2 − (v+0.5)/H·π`，`d = [cos el·cos az, cos el·sin az, sin el]`。
+
+    为什么必须区分：等距柱状的仰角是 `sin` 关系，等效针孔是 `tan` 关系，
+    两者只在**光轴附近**接近，到 90° 会发散。用针孔去反投影 360° 全景，
+    远离光轴的部分会系统性错位 —— 而且错得很"合理"，不容易发现。
+    """
+    uv = np.asarray(uv, dtype=np.float64).reshape(-1, 2)
+    if str(frame.meta.get("projection", "pinhole")) == "equirect":
+        K = frame.intrinsics
+        W, H = float(K.width), float(K.height)
+        az = (uv[:, 0] + 0.5) / W * 2.0 * np.pi - np.pi
+        el = np.pi / 2.0 - (uv[:, 1] + 0.5) / H * np.pi
+        cos_el = np.cos(el)
+        return np.stack([cos_el * np.cos(az), cos_el * np.sin(az),
+                         np.sin(el)], axis=1)
+    K = frame.intrinsics
+    d = np.stack([(uv[:, 0] - float(K.cx)) / float(K.fx),
+                  (uv[:, 1] - float(K.cy)) / float(K.fy),
+                  np.ones(uv.shape[0])], axis=1)
+    return d / np.maximum(np.linalg.norm(d, axis=1, keepdims=True), 1e-12)
+
+
+def unproject_pixels(frame: RGBDFrame, uv: np.ndarray,
+                     depth_values: np.ndarray) -> np.ndarray:
+    """像素 + 对应深度值 → **世界系** 3D 点（自动识别投影模型与深度语义）。
+
+    · 针孔：深度是沿光轴的 **z 分量**，所以 `p_cam = z · k`（`k_z = 1`）；
+    · 等距柱状全景：深度是从光心起算的**斜距 r**，
+      所以 `p_world = C + r · d_world`。
+
+    这两种语义**不能混用**：把斜距当 z 深度用（或反过来）会让远离光轴的
+    像素沿视线方向被拉伸或压缩。
+    """
+    uv = np.asarray(uv, dtype=np.float64).reshape(-1, 2)
+    z = np.asarray(depth_values, dtype=np.float64).reshape(-1)
+
+    if str(frame.meta.get("projection", "pinhole")) == "equirect":
+        K = frame.intrinsics
+        W, H = float(K.width), float(K.height)
+        az = (uv[:, 0] + 0.5) / W * 2.0 * np.pi - np.pi
+        el = np.pi / 2.0 - (uv[:, 1] + 0.5) / H * np.pi
+        cos_el = np.cos(el)
+        d_cam = np.stack([cos_el * np.cos(az), cos_el * np.sin(az),
+                          np.sin(el)], axis=1)
+        R = np.asarray(frame.pose.R, dtype=np.float64).reshape(3, 3)
+        # 相机系 → 世界系（旋转部分是 Rᵀ）
+        d_world = d_cam @ R
+        origin = np.asarray(frame.pose.camera_center(), dtype=np.float64).reshape(3)
+        return origin[None, :] + z[:, None] * d_world
+
+    # 针孔：`p_cam = z · k`，`k = [(u−cx)/fx, (v−cy)/fy, 1]`（`k_z = 1`）。
+    # 这里刻意写成**最直接的形式**（而不是"先归一化再除回 z 分量"），
+    # 以免多一次归一化引入与历史产物不可比的浮点差异。
+    K = frame.intrinsics
+    k = np.stack([(uv[:, 0] - float(K.cx)) / float(K.fx),
+                  (uv[:, 1] - float(K.cy)) / float(K.fy),
+                  np.ones(uv.shape[0])], axis=1)
+    return frame.pose.cam_to_world(z[:, None] * k)
+
+
 def backproject_detection(
     detection: Detection2D,
     frame: RGBDFrame,
@@ -346,12 +414,8 @@ def backproject_detection(
     z = flat_depth[idx].astype(np.float64)
 
     uv = pixel_grid(width, height, flatten=True)[idx]
-    x = (uv[:, 0] - frame.intrinsics.cx) * z / frame.intrinsics.fx
-    y = (uv[:, 1] - frame.intrinsics.cy) * z / frame.intrinsics.fy
-    points_cam = np.stack([x, y, z], axis=1)
-
-    # 4) 相机系 → 世界系
-    points_world = frame.pose.cam_to_world(points_cam)
+    # 4) 反投影到世界系（自动识别针孔 / 等距柱状全景，见 unproject_pixels）
+    points_world = unproject_pixels(frame, uv, z)
 
     # 5) 点数上限保护
     if points_world.shape[0] > max_points:
