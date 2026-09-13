@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import tarfile
 from collections import defaultdict
@@ -85,21 +86,25 @@ def report_prefixes(members, depth: int = 3, top_n: int = 30) -> None:
 def pick_one_location(members) -> dict:
     """从清单里挑出一个采集点，看它有哪些模态。
 
-    命名约定（官方 README）：`camera_{uuid}__{room}_{i}_frame_{j}_domain__xxx`
-    但**不假定**，而是从实际文件名里提取 uuid。
+    ⚠️ **实际命名与官方 README 不一致**（核验出来的）：
+      README 写的是 `camera_{uuid}__{room}_{i}_frame_{j}_domain__xxx`（**双**下划线），
+      实际文件是   `camera_{uuid}_{room}_{i}_frame_{j}_domain_{modality}.png`（**单**下划线）。
+      所以这里用按 uuid 特征（32 位十六进制）匹配的方式，
+      而不是照 README 的模板硬套 —— 模板套错就一个文件都匹配不到。
     """
+    uuid_re = re.compile(r"camera_([0-9a-f]{32})_")
+    raw_uuid_re = re.compile(r"^([0-9a-f]{32})_")
     uuids = defaultdict(set)
     for name, _ in members:
         base = name.rsplit("/", 1)[-1]
-        if base.startswith("camera_") and "__" in base:
-            uuid = base.split("__")[0].replace("camera_", "")
-            # 记录它出现在哪个模态目录下
-            parts = name.split("/")
-            if len(parts) >= 4:
-                uuids[uuid].add("/".join(parts[1:3]))
+        m = uuid_re.match(base) or raw_uuid_re.match(base)
+        if not m:
+            continue
+        parts = name.split("/")
+        if len(parts) >= 4:
+            uuids[m.group(1)].add("/".join(parts[1:3]))
     if not uuids:
         return {}
-    # 挑模态最全的那个 uuid
     uuid = max(uuids, key=lambda u: len(uuids[u]))
     return {"uuid": uuid, "modalities": sorted(uuids[uuid])}
 
@@ -115,14 +120,30 @@ def report_one_location(members, uuid: str) -> None:
     print(f"\n  采集点 {uuid} 的模态与帧数：")
     for mod, items in sorted(by_mod.items()):
         print(f"    {mod:<28} {len(items):>4} 个文件")
-    # 检查"每个模态是否都有 18 帧"
+    # `/raw` 才是"18 视角"的出处（3 俯仰 × 6 方位）
     for mod, items in sorted(by_mod.items()):
-        if mod.endswith("/rgb") or mod.endswith("/depth"):
-            n = len(items)
-            flag = "✓" if n == VIEWS_PER_LOCATION else f"⚠ 期望 {VIEWS_PER_LOCATION}"
-            print(f"    → {mod} 帧数 {n}  {flag}")
-            for base, size in sorted(items)[:4]:
-                print(f"        {base}  ({size / 1024:.0f} KB)")
+        if mod.endswith("/raw"):
+            rx = {
+                "raw RGB": re.compile(r"^[0-9a-f]{32}_i(\d)_(\d)\.(jpg|png)$"),
+                "raw 深度": re.compile(r"^[0-9a-f]{32}_d(\d)_(\d)\.(jpg|png)$"),
+                "raw 位姿": re.compile(r"^[0-9a-f]{32}_pose_(\d)_(\d)\.txt$"),
+                "raw 内参": re.compile(r"^[0-9a-f]{32}_intrinsics_(\d)\.txt$"),
+            }
+            for label, r in rx.items():
+                hits = [(b, s) for b, s in items if r.match(b)]
+                pitches = sorted({r.match(b).group(1) for b, _ in hits})
+                yaws = sorted({r.match(b).group(2) for b, _ in hits}) \
+                    if r.groups >= 2 else []
+                if hits:
+                    print(f"    → {label:<10} {len(hits):>3} 个   俯仰 {pitches}   "
+                          f"方位 {yaws}   合计 {len(pitches) * max(len(yaws), 1)} 视角")
+            for b, s in sorted(items)[:3]:
+                print(f"        {b}  ({s / 1024:.0f} KB)")
+    # data/ 是"常规图像"，每点比 raw 多
+    if any(m.endswith("/data/rgb") for m in by_mod):
+        n = len(by_mod["area_1/data/rgb"]) if "area_1/data/rgb" in by_mod else 0
+        print("    （注：`/data/rgb` 这类「常规」模态每点的帧数**多于** 18，"
+              "这是官方在更多方向上渲染的结果）")
 
 
 # ==========================================================================
@@ -192,18 +213,28 @@ def inspect_depth(tar_path: Path, members, uuid: str) -> None:
         print(f"    ⚠️ 不是 uint16（实际 {arr.dtype}）—— 换算规则要重新确认")
 
 
-def inspect_pointcloud(tar_path: Path, members) -> None:
-    """读 3D 点云 mat，核验物体框与实例标签的实际结构（这是我们的 GT 来源）。"""
+def inspect_pointcloud(tar_path: Path, members, max_load_gb: float = 1.5) -> None:
+    """读 3D 点云 mat，核验物体框与实例标签的实际结构（这是我们的 GT 来源）。
+
+    ⚠️ 内存保护：`Area_#_PointCloud.mat` 可能有好几个 GB，而 scipy 载入时
+    还会再放大 2~3 倍。所以超过 `max_load_gb` 就**不整个读进来**，
+    只报告大小并给出后续处理建议 —— 宁可晚一步，也不要 OOM。
+    """
     target = None
     for name, size in members:
-        if name.endswith(".mat") and "PointCloud" in name:
+        if name.lower().endswith("pointcloud.mat"):
             target = (name, size)
             break
     if not target:
         print("\n  [WARN] 没找到 PointCloud.mat；跳过 GT 核验")
         return
     name, size = target
-    print(f"\n  3D 点云：{name}  ({size / (1 << 20):.1f} MB)")
+    print(f"\n  3D 点云：{name}  ({size / (1 << 30):.2f} GB)")
+    if size / (1 << 30) > max_load_gb:
+        print(f"    ⚠️ 超过内存保护阈值 {max_load_gb} GB，**不整个载入**。")
+        print("       后续处理建议：用 `matfile` 或 h5py 做**变量级**读取，")
+        print("       或用 `scipy.io.loadmat(..., variable_names=[...])` 只取需要的变量。")
+        return
     try:
         import scipy.io as sio
     except ImportError:
