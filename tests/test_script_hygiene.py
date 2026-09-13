@@ -168,15 +168,30 @@ def _is_source_command(stripped: str) -> bool:
 # Python 脚本
 # ==========================================================================
 def test_python_scripts_have_no_bom_or_crlf():
-    """`.py` 脚本不要 BOM、不要 CRLF（BOM 会让某些工具把首行当语法错）。"""
+    """**所有** `.py` 都不要 BOM、不要 CRLF（BOM 会让某些工具把首行当语法错）。
+
+    ★ 原先只扫 `scripts/`，于是 `src/` 与 `tests/` 下的同类问题会漏掉 ——
+    实测就漏了 4 个（`data/corpus/datacard.py`、`deployment/ros2/nodes.py`、
+    `deployment/ros2/tf.py`、`tests/test_corpus.py` 都带 CRLF）。
+    git 靠 `.gitattributes` 的 `text=auto eol=lf` 在提交时归一化，
+    所以**仓库里看不出来**（`git status` 干净），但工作区文件本身不规范，
+    在 Linux/WSL 下容易引起 diff 噪声与工具误判。现已扩到全仓库。
+    """
     bad = []
-    for p in _scripts(".py"):
-        raw = p.read_bytes()
-        if raw.startswith(UTF8_BOM):
-            bad.append(f"{p.relative_to(ROOT)}: 有 BOM")
-        if b"\r\n" in raw:
-            bad.append(f"{p.relative_to(ROOT)}: 有 CRLF")
-    assert not bad, "以下 Python 脚本编码不规范：\n" + "\n".join(f"  {b}" for b in bad)
+    for base in ("scripts", "src", "tests", "ros2_ws"):
+        root = ROOT / base
+        if not root.exists():
+            continue
+        for p in sorted(root.rglob("*.py")):
+            if "__pycache__" in p.parts or not p.is_file():
+                continue
+            raw = p.read_bytes()
+            if raw.startswith(UTF8_BOM):
+                bad.append(f"{p.relative_to(ROOT)}: 有 BOM")
+            if b"\r\n" in raw:
+                bad.append(f"{p.relative_to(ROOT)}: 有 CRLF")
+    assert not bad, ("以下 Python 文件编码不规范（应为 UTF-8 无 BOM、纯 LF）：\n"
+                     + "\n".join(f"  {b}" for b in bad))
 
 
 def test_unified_runners_mention_current_scripts():
