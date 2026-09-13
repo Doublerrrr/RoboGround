@@ -36,7 +36,7 @@ cd G:\RoboGround
 pip install -e ".[dev]"
 
 python scripts/00_quickstart.py        # 全离线端到端，10 秒
-pytest                                  # 516 个测试，约 12 秒
+pytest                                  # 517 个测试，约 12 秒
 python scripts/01_check_env.py         # 环境自检
 ```
 
@@ -133,7 +133,7 @@ ros2_ws/    ★ 标准 ament 包（colcon build → ros2 run / ros2 launch）
               src/roboground_ros/roboground_ros/{perception_node,query_node,launch_args,tf_spec}.py
               src/roboground_ros/{launch/*.py ×3, config/roboground.yaml}
               README.md（安装 / 运行 / 参数 / TF 树 / 验证 / 诚实清单）
-tests/      516 个测试（492 默认 + 24 slow），全部通过
+tests/      517 个测试（493 默认 + 24 slow），全部通过
 docs/       技术方案 / 运行手册 / 实现笔记 / 简历要点 / 面试QA
             真实后端集成报告 / WSL_ROS2_安装指南
             视频数据管线报告 / GRPO_RLVR报告 / 面试答题稿_VLM与RL
@@ -708,7 +708,7 @@ DBSCAN 会把桌上和桌边的物体粘成一个。改用**实例关联**
 
 ## 五、当前状态（迁移时点）
 
-- **S1~S5 代码全部完成**，516 个测试全部通过（492 默认 + 24 slow）。
+- **S1~S5 代码全部完成**，517 个测试全部通过（493 默认 + 24 slow）。
 - **几何层已在真实 SUN RGB-D 上验证**：
   - 场景索引：10335 场景 / 64783 GT 框
   - GT 框中心投影有效率 **90.5%**

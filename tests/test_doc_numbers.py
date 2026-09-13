@@ -167,3 +167,84 @@ def test_per_package_table_matches_reality():
             offenders.append(f"「{pkg}」写了 {cf} 文件 / {cl} 行，实际 {files} 文件 / {lines} 行")
     assert not offenders, "按包分布表与实际不符：\n" + "\n".join(
         f"  {o}" for o in offenders) + FIX_HINT
+
+
+# ==========================================================================
+# 跨文档的**全局计数**（这类数字之前被审计脚本漏掉了，靠人工发现）
+# ==========================================================================
+def test_docs_global_counts_match_reality():
+    """★ 任何文档里的「docs N 篇 / scripts N 个 / src N 文件 N 行 / tests N 文件」
+    都必须与实际一致。
+
+    为什么单列一条：`scripts/25_audit_doc_numbers.py` 只覆盖
+    「清单文档」里的规模表与按包表，**管不到散落在其它文档里的同类说法** ——
+    实测漏过 13 处（`docs/` 篇数在 README 与清单里写 15、实际 18；
+    `scripts` 写 31、实际 36；`data/` 行数在 3 个文件里写 6,306、实际 7,324；
+    `geometry/` 写 1,136、实际 1,240；"445 全绿"等）。
+    这类数字**最容易过期又最显眼**（简历、面试稿都在引用），所以自动守。
+    """
+    import pathlib
+
+    def _py(base: pathlib.Path):
+        fs = [p for p in base.rglob("*.py") if "__pycache__" not in p.parts]
+        return len(fs), sum(len(p.read_text(encoding="utf-8", errors="replace")
+                                .splitlines()) for p in fs)
+
+    n_docs = len(list((ROOT / "docs").glob("*.md")))
+    scr = [p for p in (ROOT / "scripts").glob("*.py")]
+    n_scr = len([p for p in scr if p.name[:2].isdigit()])
+    n_src, l_src = _py(ROOT / "src")
+    n_tst, l_tst = _py(ROOT / "tests")
+    pkg = {}
+    for d in sorted(p for p in (ROOT / "src" / "roboground").iterdir()
+                    if p.is_dir() and p.name != "__pycache__"):
+        fs = [f for f in d.rglob("*.py") if "__pycache__" not in f.parts]
+        pkg[d.name] = (len(fs),
+                       sum(len(f.read_text(encoding="utf-8", errors="replace").splitlines())
+                           for f in fs))
+
+    allowed = {
+        "docs 篇数": {n_docs},
+        "scripts 个数": {n_scr},
+        "src 文件数": {n_src},
+        "tests 文件数": {n_tst},
+    }
+    # (正则, 取第几个捕获组作为该计数)
+    # ⚠️ 必须**显式指定组号**：同一行里同时有「测试数」和「文件数」
+    #   （如 `tests **516 个**（23 文件 7,941 行）`），
+    #   若把所有捕获组都当候选值，会把 516 误判成"文件数"而误报。
+    #   第一版就是这么写的，直接产生了一条假告警。
+    patterns = [
+        ("docs 篇数", r"docs/?\s*[`\s]*(\d+)\s*篇", 1),
+        ("docs 篇数", r"文档清单（(\d+)\s*份", 1),
+        ("scripts 个数", r"scripts/\*?\.?p?y?`?\s*[（(](\d+)\s*个", 1),
+        ("src 文件数", r"src\s*\*{0,2}(\d+)\s*文件", 1),
+        ("tests 文件数", r"tests\s*\*{0,2}\d+\s*个\*{0,2}（(\d+)\s*文件", 1),
+    ]
+    offenders = []
+    for f in DOC_FILES:
+        if not f.exists():
+            continue
+        text = f.read_text(encoding="utf-8", errors="replace")
+        for i, line in enumerate(text.splitlines(), 1):
+            for name, pat, grp in patterns:
+                for m in re.finditer(pat, line):
+                    v = int(m.group(grp))
+                    if v not in allowed[name]:
+                        offenders.append(
+                            f"{f.relative_to(ROOT)}:{i} 写了「{name} = {v}」，"
+                            f"实际 {sorted(allowed[name])}")
+            # 按包行数：任何文档里出现 `data/` / `geometry/` 的「N 文件 / N 行」
+            # 或表格形式 `| \`data/\` | N | N |`
+            for p, (files, lines) in pkg.items():
+                for m in re.finditer(
+                        rf"`{re.escape(p)}/?`[^|\n]*\|\s*\*{{0,2}}(\d+)\*{{0,2}}\s*\|\s*\*{{0,2}}([\d,]+)",
+                        line):
+                    cf, cl = int(m.group(1)), int(m.group(2).replace(",", ""))
+                    if (cf, cl) != (files, lines):
+                        offenders.append(
+                            f"{f.relative_to(ROOT)}:{i} 里 `{p}/` 写了 {cf} 文件 / "
+                            f"{cl} 行，实际 {files} 文件 / {lines} 行")
+
+    assert not offenders, "跨文档的全局计数与实际不符：\n" + "\n".join(
+        f"  {o}" for o in dict.fromkeys(offenders)) + FIX_HINT
