@@ -99,7 +99,7 @@ RoboGround/
 │   ├── rl/            后训练：GRPO + 可验证奖励（RLVR）
 │   └── eval/          yaw 有向盒 3D IoU、检测指标、定位误差
 ├── ros2_ws/           ★ 标准 ament 包（package.xml / setup.py / launch ×3 / 参数 YAML）
-├── scripts/           00~37 可执行脚本（36 个，空号 08/26/27）+ scripts/wsl/ ROS2 部署验证
+├── scripts/           00~38 可执行脚本（37 个，空号 08/26/27）+ scripts/wsl/ ROS2 部署验证
 ├── configs/           4 套配置（离线 / 开放词汇 / VLM / 真实数据）
 ├── tests/             518 个测试（494 默认 + 24 真实数据）
 └── docs/              18 篇文档（见下方导航）
@@ -116,6 +116,7 @@ RoboGround/
 | 视频管线（镜头检测 / 抽帧 / 去重） | [`docs/视频数据管线报告.md`](docs/视频数据管线报告.md) |
 | 真实模型实测与集成踩坑 | [`docs/真实后端集成报告.md`](docs/真实后端集成报告.md) |
 | **★ 真实多视角 → 360° 全景融合** | [`docs/多视角全景融合报告.md`](docs/多视角全景融合报告.md) —— 2D-3D-S 多视角融合 + 与官方全景逐像素比对 |
+| **★ 链路可视化（直接看图）** | [`pipeline_1_inputs`](docs/figures/pipeline_1_inputs.png)（真实输入视角）→ [`pipeline_2_fusion`](docs/figures/pipeline_2_fusion.png)（融合全景）→ [`pipeline_3_objects`](docs/figures/pipeline_3_objects.png)（物体坐标投回全景）→ [`pipeline_4_topdown`](docs/figures/pipeline_4_topdown.png)（俯视图）｜生成脚本 `scripts/38_visualize_pipeline.py` |
 | 多视角数据核查（**历史记录**：一次自我纠错，那条链路已删） | [`docs/多视角数据核查报告.md`](docs/多视角数据核查报告.md) |
 | **ROS2 部署怎么做** | [`ros2_ws/README.md`](ros2_ws/README.md) |
 | RL 后训练（GRPO / RLVR） | [`docs/GRPO_RLVR报告.md`](docs/GRPO_RLVR报告.md) |
