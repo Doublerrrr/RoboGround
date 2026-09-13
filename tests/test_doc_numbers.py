@@ -92,7 +92,7 @@ def test_docs_do_not_claim_wrong_test_counts(real_counts):
                                      f"default={real_counts['default']} / "
                                      f"slow={real_counts['slow']}")
             # `**386**（362 默认 + 24 慢速）` 这种没有"个测试"字样的写法
-            for mm in re.finditer(r"\*\*(\d{3,4})\*\*（(\d{3,4}) 默认 \+ (\d{1,3})", line):
+            for mm in re.finditer(r"\*\*(\d{3,4})\s*个?\*\*（(\d{3,4}) 默认 \+ (\d{1,3})", line):
                 if (int(mm.group(1)), int(mm.group(2)), int(mm.group(3))) != (
                         real_counts["total"], real_counts["default"], real_counts["slow"]):
                     offenders.append(f"{f.relative_to(ROOT)}:{i} 写了 "

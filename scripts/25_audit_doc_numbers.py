@@ -363,7 +363,7 @@ def fix_generic_counts(m: Dict) -> int:
                     return mm.group(0)
                 return (f"**{m['total']}**（{m['default']} 默认 + {m['slow']}")
 
-            line = re.sub(r"\*\*(\d{3,4})\*\*（(\d{3,4}) 默认 \+ (\d{1,3})", _sub3, line)
+            line = re.sub(r"\*\*(\d{3,4})\s*个?\*\*（(\d{3,4}) 默认 \+ (\d{1,3})", _sub3, line)
 
             def _sub2(mm):
                 nums = (int(mm.group(1)), int(mm.group(2)))
