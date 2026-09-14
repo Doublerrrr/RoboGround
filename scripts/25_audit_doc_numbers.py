@@ -178,11 +178,46 @@ def scan_claims(m: Dict, tree: Dict, mods: Dict[str, int], pkgs: Dict):
                 if old != new:
                     fixable.append((f, old, new))
 
+        # 1b) ★ 模式化的总测试数修正（含**形容词**的写法）
+        #
+        # 为什么需要：`COUNT_FIXES` 是**硬编码白名单**，键会随数字更新而失效 ——
+        # 实测就出现过"白名单里全是 386，而文档早已改成 494"的情况，
+        # 于是 `--fix` **静默什么都不做**，数字继续漂。
+        #
+        # 为什么仍然安全（三道护栏，缺一不可）：
+        #   · 只改 **3 位数且 > 100** 的数字 —— 测试总数是三位数；
+        #     单文件计数（十几~几十）与"10 个测试类别"这类都不会被碰；
+        #   · **跳过含具体测试文件路径的行**（`tests/test_x.py`）——
+        #     那些是单文件计数，由另一条规则负责；
+        #   · **跳过含子集限定词的行**（相关/其中/这类…）——
+        #     "test_deployment.py 里有 10 个相关测试"说的是子集，不是总数。
+        _file_ref = re.compile(r"tests[\\/][\w\\/]+\.py")
+        _subset = ("相关", "其中", "这类", "此类", "那些", "上述", "涉及", "部分")
+        _claim = re.compile(r"(\d{3,4})\s*个([^，。、\s]{0,6})(测试)")
+        for line in text.splitlines():
+            if _file_ref.search(line):
+                continue
+            for mm in _claim.finditer(line):
+                n, adj = int(mm.group(1)), mm.group(2)
+                if n <= 100 or any(w in adj for w in _subset):
+                    continue
+                if n in (m["total"], m["default"], m["slow"]):
+                    continue
+                # 形容词决定该替换成总数还是默认数
+                target = m["default"] if "默认" in adj else m["total"]
+                old_s, new_s = mm.group(0), f"{target} 个{adj}测试"
+                if old_s != new_s:
+                    fixable.append((f, old_s, new_s))
+
         for i, line in enumerate(text.splitlines(), 1):
-            # 2) 任何"NNN 个测试"里的 NNN 与实际不符 → 告警（人工确认）
-            for num in re.findall(r"(\d{2,4})\s*个测试", line):
+            # 2) 任何"NNN 个[形容词]测试"里的 NNN 与实际不符 → 告警
+            for mm in re.finditer(r"(\d{2,4})\s*个[^，。、\s]{0,6}测试", line):
+                num = mm.group(1)
                 n = int(num)
-                if n not in (m["total"], m["slow"], m["default"]) and n > 100:
+                if (_file_ref.search(line) or n <= 100
+                        or any(w in mm.group(0) for w in _subset)):
+                    continue
+                if n not in (m["total"], m["slow"], m["default"]):
                     warnings.append((f, i, f"「{num} 个测试」与实际（{m['total']}）不符"))
             # 3) 分文件测试数：同一行里出现 test_xxx.py 和 N 个测试
             files_in_line = re.findall(r"(test_\w+\.py)", line)

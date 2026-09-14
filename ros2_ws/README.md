@@ -4,7 +4,7 @@
 `colcon build` → `ros2 run` / `ros2 launch`，参数可在线调，位姿走标准 TF 树。
 
 > 算法本体在 `roboground` 包里（`src/roboground/`），本包**只做 ROS2 侧接线**。
-> 这个边界是刻意的：494 个离线测试里绝大多数不需要 ROS2，
+> 这个边界是刻意的：525 个离线测试里绝大多数不需要 ROS2，
 > 而 ROS2 侧保持薄才便于"换机器人只改接线"。
 
 ---
@@ -167,7 +167,7 @@ ros2 run tf2_ros tf2_echo map camera_color_optical_frame
 | `python3 scripts/wsl/20_rosbag_e2e.py` | rosbag2 录制 + 回放 + QoS A/B |
 | `bash scripts/wsl/04_verify_ros2.sh --pose tf` | 三种位姿来源的端到端 |
 | `powershell -File scripts\wsl\30_run_all_ros2.ps1` | **上面全部**，汇总成一张表 |
-| `pytest` | 494 个离线测试（不需要 ROS2，含本包的结构性断言） |
+| `pytest` | 525 个离线测试（不需要 ROS2，含本包的结构性断言） |
 
 > ⚠️ **性能类指标必须在"环境变化后"重跑**。
 > 这不是套话：把"10 Hz 丢帧率 0.0%"写进文档之后，**电脑重启了一次**，
