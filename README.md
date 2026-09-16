@@ -3,7 +3,7 @@
 **面向服务机器人的开放词汇 3D 场景理解与语言接地系统。**
 从 RGB-D 视频流建出带语义的 3D 地图，再用自然语言查询它。
 
-`Python` · `PyTorch` · `ROS2 Humble` · 全链路**零下载可跑** · **525 个测试**全绿
+`Python` · `PyTorch` · `ROS2 Humble` · 全链路**零下载可跑** · **529 个测试**全绿
 
 ---
 
@@ -43,7 +43,7 @@
 pip install -e ".[dev]"
 
 python scripts/00_quickstart.py     # 零下载跑通全链路（约 10 秒）
-pytest                              # 525 个离线测试（约 13 秒，无需 GPU）
+pytest                              # 529 个离线测试（约 13 秒，无需 GPU）
 pytest -m slow                      # 另 24 个真实数据测试（需 SUN RGB-D）
 ```
 
@@ -99,9 +99,9 @@ RoboGround/
 │   ├── rl/            后训练：GRPO + 可验证奖励（RLVR）
 │   └── eval/          yaw 有向盒 3D IoU、检测指标、定位误差
 ├── ros2_ws/           ★ 标准 ament 包（package.xml / setup.py / launch ×3 / 参数 YAML）
-├── scripts/           00~38 可执行脚本（37 个，空号 08/26/27）+ scripts/wsl/ ROS2 部署验证
+├── scripts/           00~39 可执行脚本（38 个，空号 08/26/27）+ scripts/wsl/ ROS2 部署验证
 ├── configs/           4 套配置（离线 / 开放词汇 / VLM / 真实数据）
-├── tests/             525 个测试（501 默认 + 24 真实数据）
+├── tests/             529 个测试（505 默认 + 24 真实数据）
 └── docs/              18 篇文档（见下方导航）
 ```
 

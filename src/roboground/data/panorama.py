@@ -223,7 +223,7 @@ def _angle_weight(dirs: np.ndarray, forward: np.ndarray, *, power: float,
 # 主接口
 # ==========================================================================
 def _prepare_view(frame, W: int, H: int, *, weight_power: float, min_cos: float,
-                  max_depth: float):
+                  max_depth: float, depth_semantics: str = "range"):
     """把一帧整理成融合需要的扁平数组；没有可用像素时返回 None。
 
     返回 `(pix, wf, color_flat, range_flat)`，都是**一维**（长度 = 该帧像素数）。
@@ -237,6 +237,14 @@ def _prepare_view(frame, W: int, H: int, *, weight_power: float, min_cos: float,
         → `r = |p_cam| = z · |k| = z / d_cam.z`
 
     这里 `d_cam.z` 可以由 `d_cam = R @ d_world` 直接取出（`d_world` 已归一化）。
+
+    Parameters
+    ----------
+    depth_semantics
+        · `"range"`（默认）：把 z 深度换算成**斜距**后返回。
+        · `"z"`：**直接返回原始 z 深度**。这是给**消融实验**用的 ——
+          用来量化"不做这个换算"会差多少（见 `scripts/39_ablate_pano_fusion.py`）。
+          生产路径**不应该**用它。
     """
     depth = np.asarray(frame.depth_m, dtype=np.float64)
     color = np.asarray(frame.color)
@@ -260,6 +268,18 @@ def _prepare_view(frame, W: int, H: int, *, weight_power: float, min_cos: float,
     d_cam_z = (dirs @ R.T)[..., 2]           # (R @ d).z 展开成 d @ R.T
     # 光轴方向 d_cam_z = 1 → r = z；越靠边缘 d_cam_z 越小 → r 越大
     z_ok = d_cam_z > 1e-6
+    if depth_semantics == "z":
+        # 消融臂：停在 z 深度（不做换算）。注意门限仍作用于 z，与"修复前"一致。
+        rng_flat = np.where(z_ok, depth, 0.0)
+        r_ok = z_ok & (depth > 0) & (depth <= float(max_depth))
+        w = w * r_ok
+        if not w.any():
+            return None
+        u, v, _el = directions_to_equirect(dirs, W, H)
+        pix = (v.ravel() * W + u.ravel()).astype(np.int64)
+        return (pix, w.ravel(),
+                color.reshape(-1, 3).astype(np.float64),
+                rng_flat.ravel())
     rng_flat = np.where(z_ok, depth / np.maximum(d_cam_z, 1e-12), 0.0)
     # ★ 门限必须作用在**斜距**上，不能只作用于 z 深度：
     #   若只筛 z，边缘像素（d_cam_z 可低至 0.35）换算后会得到
@@ -287,6 +307,8 @@ def fuse_to_equirect(
     max_depth: float = 8.0,
     range_outlier_m: float = 0.5,
     rgb_mode: str = "weighted_mean",
+    depth_mode: str = "consensus",
+    depth_semantics: str = "range",
 ) -> Panorama:
     """把 N 个**真实**视角融合成一张等距柱状全景。
 
@@ -310,6 +332,21 @@ def fuse_to_equirect(
         大角度上的正确观测误判为离群（详见 `Panorama` 的文档）。
     rgb_mode
         `weighted_mean`（默认，抗噪）或 `nearest`（取权重最高的样本，最锐利）。
+    depth_mode
+        **深度融合策略**，默认 `"consensus"`（本项目的做法）：
+
+        · `"consensus"`（默认）：以**权重最高的真实样本**为基准，只融合与它相差
+          不超过 `range_outlier_m` 的样本，再加权平均；
+        · `"mean"`：**不做一致性筛选**，直接对所有样本加权平均
+          （用来量化"共识筛选"到底有没有用）；
+        · `"nearest"`：**完全不融合**，取权重最高的单个样本
+          （用来量化"多视角平均"本身的价值）。
+
+        后两个是给**消融实验**用的（`scripts/39_ablate_pano_fusion.py`）。
+    depth_semantics
+        `"range"`（默认，斜距）或 `"z"`（**消融用**：不做 z→斜距换算）。
+        ⚠️ `"z"` 只会把跨视角不可比的量拿去融合，是**错误做法**，
+        保留它只为量化"这个换算值多少"。
 
     Returns
     -------
@@ -317,6 +354,12 @@ def fuse_to_equirect(
     """
     if rgb_mode not in ("weighted_mean", "nearest"):
         raise ValueError(f"rgb_mode 只支持 weighted_mean / nearest，收到 {rgb_mode!r}")
+    if depth_mode not in ("consensus", "mean", "nearest"):
+        raise ValueError(
+            f"depth_mode 只支持 consensus / mean / nearest，收到 {depth_mode!r}")
+    if depth_semantics not in ("range", "z"):
+        raise ValueError(
+            f"depth_semantics 只支持 range / z，收到 {depth_semantics!r}")
     if not frames:
         raise ValueError("frames 为空，没有可融合的视角")
 
@@ -340,7 +383,8 @@ def fuse_to_equirect(
 
     for fi, frame in enumerate(frames):
         prep = _prepare_view(frame, W, H, weight_power=weight_power,
-                             min_cos=min_cos, max_depth=max_depth)
+                             min_cos=min_cos, max_depth=max_depth,
+                             depth_semantics=depth_semantics)
         if prep is None:
             logger.warn(f"第 {fi} 帧没有可用像素（权重门限 / 深度），跳过")
             continue
@@ -381,34 +425,47 @@ def fuse_to_equirect(
     #   · 绝不会在两张不相连的表面上取平均；
     #   · 仍然能靠多视角平均降噪（一致的那些样本会被融合）。
     range_out = np.zeros((H, W), dtype=np.float32)
-    if (w_sum > 0).any():
-        # 基准 = 权重最高的样本（best_r 在累加阶段已按权重选出）
-        ref = best_r.reshape(-1)
+    flat_out = range_out.reshape(-1)
+    ref = best_r.reshape(-1)
+    if depth_mode == "nearest":
+        # 消融臂：完全不融合，直接取权重最高的单个真实样本
+        valid = best_w.reshape(-1) > 0
+        flat_out[valid] = ref[valid].astype(np.float32)
+    elif (w_sum > 0).any():
         r2_sum = np.zeros(H * W)
         r2_w = np.zeros(H * W)
         for frame in frames:
             prep = _prepare_view(frame, W, H, weight_power=weight_power,
-                                 min_cos=min_cos, max_depth=max_depth)
+                                 min_cos=min_cos, max_depth=max_depth,
+                                 depth_semantics=depth_semantics)
             if prep is None:
                 continue
             pix, wf, _color_flat, range_flat = prep
-            agree = np.abs(range_flat - ref[pix]) <= float(range_outlier_m)
-            wf2 = np.where(agree, wf, 0.0)
+            if depth_mode == "consensus":
+                # 只融合与基准一致的样本（本项目的做法）
+                wf2 = np.where(np.abs(range_flat - ref[pix]) <= float(range_outlier_m),
+                               wf, 0.0)
+            else:
+                # 消融臂 "mean"：不做一致性筛选，全部参与加权平均
+                wf2 = wf
             r2_sum += np.bincount(pix, weights=(wf2 * range_flat), minlength=H * W)[: H * W]
             r2_w += np.bincount(pix, weights=wf2, minlength=H * W)[: H * W]
         good = r2_w > 0
-        range_out.reshape(-1)[good] = (r2_sum[good] / r2_w[good]).astype(np.float32)
+        flat_out[good] = (r2_sum[good] / r2_w[good]).astype(np.float32)
         # 只有基准、没有别的样本与它一致时，就用基准本身（它是个真实观测）
         solo = (~good) & (best_w.reshape(-1) > 0)
-        range_out.reshape(-1)[solo] = ref[solo].astype(np.float32)
+        flat_out[solo] = ref[solo].astype(np.float32)
 
     return Panorama(rgb=rgb, depth_m=range_out, weight=w_sum.astype(np.float32),
                     n_views=len(frames), n_used=n_used, center=center,
                     meta={"weight_power": weight_power, "min_cos": min_cos,
                           "max_depth": max_depth, "rgb_mode": rgb_mode,
                           "range_outlier_m": range_outlier_m,
+                          "depth_mode": depth_mode,
                           "center_spread_m": spread,
-                          "depth_semantics": "range_from_center"})
+                          "depth_semantics": ("range_from_center"
+                                              if depth_semantics == "range"
+                                              else "z_depth_ABLATION")})
 
 
 def frame_for_panorama(pano: Panorama, *, frame_id: str = "panorama", pose=None):

@@ -453,3 +453,102 @@ def test_panorama_describe_has_expected_keys():
         "全景的 depth_m 是斜距，必须在 meta 里写明，否则下游会当成针孔 z 深度用"
     assert isinstance(pano, Panorama)
     assert pano.range_m is pano.depth_m or np.array_equal(pano.range_m, pano.depth_m)
+
+
+# ==========================================================================
+# 7) ★ 消融开关（depth_mode / depth_semantics）
+# ==========================================================================
+def test_depth_mode_consensus_differs_from_plain_mean():
+    """★ `depth_mode` 两个档必须**真的不同** —— 否则消融实验没有意义。
+
+    `consensus`（默认）只在"与基准一致"的样本上平均；`mean` 不做筛选、
+    全都要。当前景 2 m 与背景 5 m 同时覆盖一个像素时：
+      · consensus 会保留其中一个真实值（绝不落在中间）；
+      · mean 会把两者平均，落在一个几何上不存在的中间值。
+    """
+    K = _intrinsics(fov_deg=70.0)
+    pose = _look_at((0, 0, 1.2), (1, 0, 1.2))
+    a = _uniform_view(10, 2.0, pose, K, frame_id="near")
+    b = _uniform_view(250, 5.0, pose, K, frame_id="far")
+
+    p_con = fuse_to_equirect([a, b], width=W, height=H, min_cos=0.3,
+                             depth_mode="consensus", range_outlier_m=0.5)
+    p_mean = fuse_to_equirect([a, b], width=W, height=H, min_cos=0.3,
+                              depth_mode="mean")
+
+    # 取共同有效像素做比较
+    both = (p_con.depth_m > 0) & (p_mean.depth_m > 0)
+    assert both.sum() > 100, "两个臂都应有大量有效像素"
+    d_con = p_con.depth_m[both]
+    d_mean = p_mean.depth_m[both]
+    assert not np.allclose(d_con, d_mean), (
+        "consensus 与 mean 给出完全相同的结果 —— 消融开关没有生效")
+
+    # consensus 必须落在真实观测附近；mean 会往中间漂
+    assert np.median(d_con) < 2.6 or np.median(d_con) > 4.4, (
+        f"consensus 中位 {np.median(d_con):.2f} m 落在中间地带，说明它也在平均")
+    mid = ((d_mean > 2.6) & (d_mean < 4.4)).mean()
+    assert mid > 0.1, (
+        f"mean 只有 {mid*100:.1f}% 的像素落在中间地带，两个臂差异太小，测试没有区分力")
+
+
+def test_depth_mode_nearest_returns_a_real_sample():
+    """`nearest` 档不融合，直接取权重最高的**真实样本**（不是平均值）。"""
+    K = _intrinsics(fov_deg=70.0)
+    pose = _look_at((0, 0, 1.2), (1, 0, 1.2))
+    a = _uniform_view(10, 2.0, pose, K)
+    b = _uniform_view(250, 5.0, pose, K)
+    p = fuse_to_equirect([a, b], width=W, height=H, min_cos=0.3,
+                         depth_mode="nearest")
+    d = p.depth_m[p.depth_m > 0]
+    assert d.size > 100
+    # ⚠️ nearest 取的是**斜距**，而斜距随离轴角变化：近视角给出 2.0~2.8 m 的
+    #    **连续带**、远视角 5.0~6.9 m，而不是两个孤立点值（第一版测试就这么写错了）。
+    #    该断言的是：取值必须落在两个真实样本的带内，**不能落在两带之间**
+    #    —— 落在中间才是"平均"的产物。
+    near_band = (d >= 1.99) & (d <= 2.9)
+    far_band = (d >= 4.9) & (d <= 7.0)
+    in_between = (d > 3.0) & (d < 4.9)
+    assert not in_between.any(), (
+        f"nearest 有 {int(in_between.sum())} 个像素落在 {d[in_between][:5]} —— "
+        "这些值不属于任何真实样本，说明 nearest 档也在做平均")
+    assert (near_band | far_band).mean() > 0.999, (
+        f"nearest 只有 {(near_band | far_band).mean()*100:.2f}% 的像素落在真实样本带内")
+
+
+def test_depth_semantics_z_ablation_differs_offaxis():
+    """★ `depth_semantics="z"` 只影响**离轴**像素（光轴上两者相等）。
+
+    这正是这个坑的隐蔽之处：光轴处 z 深度 == 斜距，所以只采光轴像素的
+    测试**结构上测不出**这两种语义的差别。这里专门验离轴像素。
+    """
+    K = _intrinsics(fov_deg=90.0, size=128)
+    pose = _look_at((0, 0, 1.2), (1, 0, 1.2))
+    v = _uniform_view(128, 2.0, pose, K)          # 正对相机的平面，z ≡ 2 m
+    p_rng = fuse_to_equirect([v], width=512, height=256, min_cos=0.0,
+                             depth_mode="nearest", depth_semantics="range")
+    p_z = fuse_to_equirect([v], width=512, height=256, min_cos=0.0,
+                           depth_mode="nearest", depth_semantics="z")
+    both = (p_rng.depth_m > 0) & (p_z.depth_m > 0)
+    assert both.sum() > 100
+
+    # 光轴附近（行/列中心）两者应相等
+    r, c = 128, 256
+    if both[r, c]:
+        assert p_rng.depth_m[r, c] == pytest.approx(p_z.depth_m[r, c], rel=0.02), \
+            "光轴附近 z 深度与斜距应几乎相等"
+    # 边缘处斜距必须明显大于 z 深度
+    assert p_rng.depth_m[both].max() > p_z.depth_m[both].max() * 1.15, (
+        f"边缘处斜距（{p_rng.depth_m[both].max():.3f} m）应明显大于 z 深度"
+        f"（{p_z.depth_m[both].max():.3f} m）")
+    assert p_z.meta["depth_semantics"] == "z_depth_ABLATION"
+
+
+def test_invalid_depth_mode_and_semantics_raise():
+    K = _intrinsics()
+    pose = _look_at((0, 0, 1.2), (1, 0, 1.2))
+    v = _uniform_view(120, 2.0, pose, K)
+    with pytest.raises(ValueError):
+        fuse_to_equirect([v], width=W, height=H, depth_mode="bogus")
+    with pytest.raises(ValueError):
+        fuse_to_equirect([v], width=W, height=H, depth_semantics="bogus")
