@@ -33,6 +33,8 @@ SigLIP 的两个优势正好对症：
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any, List, Optional, Sequence
 
 import numpy as np
@@ -44,6 +46,42 @@ from roboground.types import Detection2D, RGBDFrame
 from roboground.utils.logging import get_logger
 
 logger = get_logger("perception.siglip")
+
+
+def _dim_from_model_config(model_id: str) -> Optional[int]:
+    """从**本地**权重目录的 `config.json` 里读出真实的投影维度。
+
+    只读 JSON、不加载权重，所以是秒级的；`model_id` 是 HF 仓库名
+    （本地没有这个目录）时返回 `None`，由调用方保留原值。
+
+    为什么需要它：`perception.encoder_kwargs.feature_dim` 的历史默认是 256
+    （当年为了"各后端统一投影维度"），而 SigLIP-base 真实输出 768 维。
+    两者不一致时，体素场按 256 维建、768 维特征塞不进去，
+    **整张地图的特征会静默变成 0** —— 下游只是"查不到东西"，
+    很容易被误判成"模型效果不好"。
+    """
+    try:
+        p = Path(str(model_id)) / "config.json"
+        if not p.exists():
+            return None
+        cfg = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:                                            # noqa: BLE001
+        return None
+    for path in (("text_config", "hidden_size"),
+                 ("vision_config", "hidden_size"),
+                 ("projection_dim",),
+                 ("hidden_size",)):
+        cur: Any = cfg
+        ok = True
+        for k in path:
+            if isinstance(cur, dict) and k in cur:
+                cur = cur[k]
+            else:
+                ok = False
+                break
+        if ok and isinstance(cur, int) and cur > 0:
+            return int(cur)
+    return None
 
 
 @register_encoder("siglip", "siglip-base")
@@ -89,6 +127,17 @@ class SigLIPEncoder(Encoder):
         self._processor = None
         self._model = None
         self._dim = int(feature_dim)
+        # ★ 用权重目录里的 `config.json` 校正声明维度（不加载权重，秒级）。
+        #   原因见 `encode_image` 里的注释：`encoder_kwargs.feature_dim` 的
+        #   历史默认是 256（"统一投影维度"），而 SigLIP-base 实际是 768；
+        #   两边不一致时特征场会**整张图变成 0** 且不报错。
+        #   本地路径能读到就以真实维度为准，并明确告警。
+        true_dim = _dim_from_model_config(model_id)
+        if true_dim is not None and true_dim != self._dim:
+            logger.warn(
+                f"SigLIP 声明维度 {self._dim} 与 {model_id} 的 config.json "
+                f"（{true_dim}）不一致，已按真实维度 {true_dim} 校正")
+            self._dim = int(true_dim)
         self._logit_scale: Optional[float] = None
         self._logit_bias: Optional[float] = None
 
@@ -316,5 +365,17 @@ class SigLIPEncoder(Encoder):
         with torch.no_grad():
             feats = self._model.get_image_features(**batch)
         vec = feats.detach().cpu().numpy().astype(np.float32)[0]
+        # ★ 维度自检：**报出去的维度**必须等于**真正吐出来的维度**。
+        #   实测踩过：配置里写着 `encoder_kwargs.feature_dim: 256`
+        #   （当年"统一投影维度"的历史默认），而 SigLIP-base 实际输出 768 维。
+        #   于是体素场按 256 维建、768 维特征塞不进去 ——
+        #   **整张地图的特征全是 0**，而下游只是安静地"查不到东西"，
+        #   看起来像"模型不行"，实际是**根本没接上**。
+        #   宁可在这里炸，也不要让下游拿到空特征场。
+        if int(vec.shape[-1]) != int(self._dim):
+            raise RuntimeError(
+                f"SigLIP 实际输出 {int(vec.shape[-1])} 维，但编码器声明 {self._dim} 维"
+                f"（model_id={self.model_id}）。请把 perception.encoder_kwargs.feature_dim "
+                f"设成 {int(vec.shape[-1])}，否则 3D 特征场会拿到维度不符的特征。")
         n = float(np.linalg.norm(vec))
         return vec / n if n > 1e-8 else vec
