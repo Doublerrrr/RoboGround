@@ -89,11 +89,34 @@ PROBES: Dict[str, Dict[str, List[str]]] = {
              "descriptive": ["a device that gives light"]},
 }
 
-#: 负样本：这些类别**确定不会**出现在合成场景里
-NEGATIVE_PROBES = [
+#: 负样本 A（**简单**）：语义上与室内场景毫无关系。
+#: ⚠️ 这类负样本**参考价值很低** —— 一个颜色直方图都能拒掉它。
+#: 早期版本**只**用了这一类，于是"拒识率 100%"这个数字是白送的，
+#: 在评审眼里是红旗而不是亮点。保留它只为**对照**，不作为主指标。
+NEGATIVE_PROBES_EASY = [
     "冰箱", "微波炉", "马桶", "浴缸", "飞机", "汽车", "自行车",
     "refrigerator", "helicopter", "airplane", "bicycle", "submarine",
 ]
+
+#: ★ 负样本 B（**难**）：**与地图内类别语义高度接近**，但地图里确实没有。
+#: 这才是"拒识能力"的真正试金石：嵌入模型必须真的分得开 chair / armchair。
+#: 注意 `armchair` 里**含子串 `chair`**，会直接冲击词法路径的子串规则（0.85 分）——
+#: 这是**故意**设计的对抗样本。
+#:
+#: 用法：按场景动态选取 —— 只有当"相邻的正类"真的在该场景地图里，
+#: 且该负样本自己**不在**地图里时，才把它作为负样本加入。
+HARD_NEGATIVES: Dict[str, List[str]] = {
+    "chair": ["armchair", "stool", "bench", "扶手椅", "长凳"],
+    "sofa": ["loveseat", "futon", "躺椅"],
+    "table": ["countertop", "workbench", "吧台"],
+    "shelf": ["cabinet", "wardrobe", "locker", "柜子", "衣柜"],
+    "monitor": ["television", "laptop", "tablet", "电视", "笔记本电脑"],
+    "box": ["crate", "basket", "篮子"],
+    "bottle": ["jar", "canister", "罐子"],
+    "lamp": ["lantern", "chandelier", "吊灯"],
+    "trash can": ["dumpster", "recycling bin"],
+    "cup": ["bowl", "vase", "花瓶", "wine glass"],
+}
 
 #: 各编码器的嵌入阈值扫描范围（按量级取对数刻度）。
 #: SigLIP 在地图物体特征上的分数极小（正确命中只有 1e-3 量级），
@@ -171,8 +194,16 @@ def collect_scores(scenes, encoder, offset: float = 0.92) -> List[QuerySample]:
             for pk, plist in PROBES.get(lab, {}).items():
                 for p in plist:
                     queries.append(("probe", p, lab, pk))
-        for p in NEGATIVE_PROBES:
-            queries.append(("negative", p, None, "named"))
+        for p in NEGATIVE_PROBES_EASY:
+            queries.append(("negative_easy", p, None, "named"))
+        # ★ 难负样本：只取"相邻正类确实在这个场景里、且自己不在"的那些
+        for pos, negs in HARD_NEGATIVES.items():
+            if pos not in present:
+                continue
+            for n in negs:
+                if n in present:
+                    continue          # 它真的在地图里 → 不能当负样本
+                queries.append(("negative_hard", n, None, "named"))
 
         for kind, q, expect, pk in queries:
             fused, lex, emb = eng._score_candidates(q, obj_labels, feats, counts)
@@ -285,6 +316,8 @@ def evaluate_at(samples: List[QuerySample], t_lex: float, t_emb: float,
         return s.lex, s.emb
 
     hit_named, hit_desc, rej = [], [], []
+    rej_easy: List[float] = []
+    rej_hard: List[float] = []
     used_thr: List[float] = []
     for s in samples:
         lex, emb = view(s)
@@ -300,7 +333,7 @@ def evaluate_at(samples: List[QuerySample], t_lex: float, t_emb: float,
             if s.kind == "probe":
                 (hit_named if s.probe_kind == "named" else hit_desc).append(0.0)
             else:
-                rej.append(1.0)
+                (rej_hard if s.kind == "negative_hard" else rej_easy).append(1.0)
             continue
         acc = _accept(lex, emb, t_l, t_e)
         score = _rank(lex, emb, s.fused, t_l, t_e)
@@ -310,17 +343,28 @@ def evaluate_at(samples: List[QuerySample], t_lex: float, t_emb: float,
         if s.kind == "probe":
             ok = float(idx.size > 0 and s.labels[int(idx[0])] == s.expect)
             (hit_named if s.probe_kind == "named" else hit_desc).append(ok)
+        elif s.kind == "negative_hard":
+            rej_hard.append(float(idx.size == 0))
         else:
-            rej.append(float(idx.size == 0))
+            rej_easy.append(float(idx.size == 0))
 
     all_hits = hit_named + hit_desc
     h = float(np.mean(all_hits)) if all_hits else 0.0
+    rej = rej_easy + rej_hard                 # 合计（旧的 reject 字段保持兼容）
     r = float(np.mean(rej)) if rej else 0.0
+    r_easy = float(np.mean(rej_easy)) if rej_easy else float('nan')
+    r_hard = float(np.mean(rej_hard)) if rej_hard else float('nan')
     out = {
         "n_named": len(hit_named), "hit_named": float(np.mean(hit_named)) if hit_named else 0.0,
         "n_desc": len(hit_desc), "hit_desc": float(np.mean(hit_desc)) if hit_desc else 0.0,
         "n_probe": len(all_hits), "hit": h,
         "n_negative": len(rej), "reject": r, "balanced": h * r,
+        # ★ 分开报告：简单负样本（"飞机/潜艇"）是白送的，**难负样本才是真指标**。
+        #   早期只报合计的 reject，把两类混在一起，于是"拒识 100%"看起来很像能力，
+        #   其实主要来自简单负样本 —— 这是评审点名的红旗，必须拆开。
+        "n_negative_easy": len(rej_easy), "reject_easy": r_easy,
+        "n_negative_hard": len(rej_hard), "reject_hard": r_hard,
+        "balanced_hard": h * r_hard if rej_hard else float("nan"),
     }
     if use_calibrated:
         out["thr_median"] = float(np.median(used_thr)) if used_thr else float("nan")

@@ -99,10 +99,10 @@ RoboGround/
 │   ├── rl/            后训练：GRPO + 可验证奖励（RLVR）
 │   └── eval/          yaw 有向盒 3D IoU、检测指标、定位误差
 ├── ros2_ws/           ★ 标准 ament 包（package.xml / setup.py / launch ×3 / 参数 YAML）
-├── scripts/           00~39 可执行脚本（38 个，空号 08/26/27）+ scripts/wsl/ ROS2 部署验证
+├── scripts/           00~40 可执行脚本（39 个，空号 08/26/27）+ scripts/wsl/ ROS2 部署验证
 ├── configs/           4 套配置（离线 / 开放词汇 / VLM / 真实数据）
 ├── tests/             529 个测试（505 默认 + 24 真实数据）
-└── docs/              18 篇文档（见下方导航）
+└── docs/              19 篇文档（见下方导航）
 ```
 
 ## 文档导航
