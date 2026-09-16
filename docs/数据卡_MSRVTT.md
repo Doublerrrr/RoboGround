@@ -1,5 +1,16 @@
 # 多模态语料数据卡
 
+> ⚠️ **原始数据已从本机删除（2026-09-13）**：`data/raw/msrvtt/`（2,990 个视频 1.92 GB + 标注）
+> 已清理以释放磁盘。**本文档的全部数字与产物仍然有效**（它们出自 `runs/corpus_report.json`
+> 等 `runs/` 产物，与原始视频无关），但**本文里的复现命令需要先重下数据**：
+>
+> ```bash
+> python scripts/fetch_corpus_data.py --dataset msrvtt --chunks 10   # 重下（约 1.9 GB）
+> ```
+>
+> **保留下来的**：`data/packed/msrvtt/`（25 个训练分片 + manifest，10.5 MB）——
+> 那是管线的**产出**，删掉的只是**输入**。
+
 > 生成时间：2026-09-11 16:13　｜　来源：`msrvtt`
 
 ## 一、规模总览
