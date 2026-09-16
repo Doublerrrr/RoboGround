@@ -224,6 +224,19 @@ def parse_intent(text: str, labels: Sequence[str] = ()) -> Intent:
     n_mentions = len(intent.mentions)
     n_matched = len(intent.matched_labels)
 
+    # ---- "问了一个地图里根本没有的词"必须明确说没找到（批评 #1 里发现的问题）----
+    #
+    # ★ 实测（scripts/43）：`airplane 在哪` / `submarine 在哪` 因为
+    #   一个已知标签都没提到，会**退化成"描述场景"**，回答
+    #   "场景中共有 28 个物体：clutter×10、wall×5…"。
+    #   从用户视角看，这像是"回答了但答错了" —— 比直接说"没找到"更糟。
+    #   所以这里：**只要带疑问词（在哪/位置/…）却一个提及都没认出来**，
+    #   就按"定位"处理并把没认出来的那段文本当作主语，
+    #   由 `_answer_locate` 走 `_not_found`。
+    unknown_subject: Optional[str] = None
+    if n_mentions == 0 and has(_LOCATE_KW):
+        unknown_subject = _unknown_subject_text(raw, labels)
+
     # ---- 优先级：距离 > 列表 > 计数 > 最近 > 关系 > 定位 > 描述 ----
     if has(_DISTANCE_KW) and n_mentions >= 2:
         intent.kind = "distance"
@@ -237,6 +250,11 @@ def parse_intent(text: str, labels: Sequence[str] = ()) -> Intent:
         intent.kind = "relation"
     elif n_mentions >= 1:
         intent.kind = "locate"
+    elif unknown_subject:
+        # 有疑问词、但一个已知词都没提到（"airplane 在哪"）——
+        # 仍然按"定位"处理，好让回答是"没找到 airplane"
+        # 而不是退化成"场景中共有 28 个物体…"
+        intent.kind = "locate"
     else:
         intent.kind = "describe"
 
@@ -249,8 +267,31 @@ def parse_intent(text: str, labels: Sequence[str] = ()) -> Intent:
         intent.subject = intent.mentions[0]
         if len(intent.mentions) >= 2:
             intent.object_ = intent.mentions[1]
+    elif unknown_subject:
+        # 一个已知词都没提到，但有疑问词 —— 用没认出来的那段文本当主语
+        intent.subject = unknown_subject
 
     return intent
+
+
+def _unknown_subject_text(text: str, labels: Sequence[str]) -> Optional[str]:
+    """从"问了个不存在的物体"的句子里抠出那个词（用于回答"没找到 X"）。
+
+    做法很朴素：去掉停用词、疑问词和地图里已知的词，剩下的第一段
+    非空文本就是用户问的东西。抠不出来就返回 None（上层用整句兜底）。
+    """
+    leftover = str(text or "")
+    for term in sorted(list(_STOPWORDS) + list(_LOCATE_KW) + list(_DISTANCE_KW)
+                       + list(_NEAREST_KW) + list(_COUNT_KW) + list(_LIST_KW)
+                       + list(_DESCRIBE_KW),
+                       key=len, reverse=True):
+        if term:
+            leftover = leftover.replace(term, " ")
+    for lab in sorted((str(x) for x in labels), key=len, reverse=True):
+        if lab:
+            leftover = leftover.replace(lab, " ")
+    leftover = leftover.strip(" \t\r\n，。？！,.?!：:；;、\"'（）()「」【】")
+    return leftover.split()[0] if leftover.split() else None
 
 
 # ==========================================================================
@@ -347,7 +388,15 @@ class RuleEngine:
             exact.sort(key=lambda o: -o.confidence)
             return exact[:k]
 
-        hits = self.map.query_text(label, top_k=k, level="object", min_score=0.30)
+        # ⚠️ 模糊兜底的分数下限**必须跟词法阈值一致**。
+        #    这里曾经硬编码 0.30，而 `SemanticMap.query_min_score` 与配置里
+        #    的词法阈值是 0.5 —— 于是规则引擎比地图查询**更松**，
+        #    未见类别更容易被 bigram 噪声蒙中（"问什么都能返回一个物体"）。
+        floor = 0.30
+        if self.cfg is not None:
+            floor = float(self.cfg.get("query.min_score_lexical",
+                                       self.cfg.get("query.min_score", floor)))
+        hits = self.map.query_text(label, top_k=k, level="object", min_score=floor)
         return [h.obj for h in hits if h.obj is not None]
 
     def _answer_locate(self, intent: Intent) -> ReasoningResult:
@@ -358,7 +407,6 @@ class RuleEngine:
         objs = self._lookup(subject)
         if not objs:
             return self._not_found(subject, intent.raw)
-
         top = objs[0]
         parts = [f"找到 {len(objs)} 个「{subject}」，最可信的一个在"]
         parts.append(

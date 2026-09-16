@@ -36,6 +36,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from roboground.data.frame_gt import box_surface_points
 from roboground.data.panorama import Panorama, frame_for_panorama, fuse_to_equirect
 from roboground.data.stanford2d3d import (
     Location,
@@ -321,22 +322,10 @@ def load_scenes(root: str | Path, *, n: int = 5, min_frames: int = 8,
 # ==========================================================================
 # GT 框 → 全景图像：投影 + 可见性
 # ==========================================================================
-def _box_surface_points(box: np.ndarray, grid: int = 6) -> np.ndarray:
-    """在轴对齐框的 6 个面上采样（只看表面，内部点没意义）。"""
-    c, s = box[:3], box[3:6]
-    lo, hi = c - s / 2.0, c + s / 2.0
-    t = np.linspace(0.0, 1.0, int(grid))
-    g = np.meshgrid(t, t, indexing="ij")
-    pts = []
-    for axis in range(3):                       # 每个轴上的两个面
-        for val in (lo[axis], hi[axis]):
-            p = np.empty((g[0].size, 3))
-            p[:, axis] = val
-            others = [a for a in range(3) if a != axis]
-            p[:, others[0]] = lo[others[0]] + g[0].ravel() * (hi[others[0]] - lo[others[0]])
-            p[:, others[1]] = lo[others[1]] + g[1].ravel() * (hi[others[1]] - lo[others[1]])
-            pts.append(p)
-    return np.concatenate(pts, axis=0)
+# 采样点定义搬到了 `frame_gt.box_surface_points`：针孔版可见性判定
+# （`frame_gt.box_to_frame`）必须与全景版用**同一套采样、同一个分母**，
+# 否则"用一帧 vs 用多帧融合"的消融会数不到一块去。这里保留旧名字。
+_box_surface_points = box_surface_points
 
 
 def box_to_pano(scene: PanoScene, box: np.ndarray, *,

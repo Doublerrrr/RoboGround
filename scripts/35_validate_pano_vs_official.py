@@ -23,15 +23,30 @@
 如果官方是"沿某轴的 z 深度"，比对结果会随仰角呈现 `1/cos(el)` 的系统性偏差，
 正好可以据此判定，脚本会把该诊断打出来。
 
+⚠️ "3 个采集点"是不够的（批评 #6）
+=================================
+早期版本只抽 3 个房间，被质疑"186 个采集点里只验了 3 个，凭什么说通用"。
+现在 `--every` 会跑**全部 186 个采集点**（实测 186/186 都有官方全景），
+并且**报告分布**（中位数 / p10 / p90 / 分档占比）而不是"平均值通过"。
+判据也随之改成"中位数达标 + 达标点占比"，因为一个长尾点不该被平均掉，
+一个漂亮的中位数也不该掩盖长尾。
+
 用法
 ====
     python scripts/35_validate_pano_vs_official.py --room office_6
     python scripts/35_validate_pano_vs_official.py --all --n 3
+    python scripts/35_validate_pano_vs_official.py --every --max-frames 24 \\
+        --out runs/35_validate_all186.json        # 全部 186 个点，可中断续跑
+
+`--every` 模式下产物**每跑完一个点就落盘一次**，中断后用同样的命令加
+`--resume` 即可从断点继续（已经算过的 uuid 会被跳过）。
 """
 from __future__ import annotations
 
 import argparse
+import json
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -266,17 +281,158 @@ def print_report(r: Dict[str, Any]) -> None:
           f"官方 {r['off_range_max']:.2f} m")
 
 
+def _dist(vals: Sequence[float], fmt: str = "{:.4f}") -> str:
+    a = np.asarray([v for v in vals if v is not None and np.isfinite(v)],
+                   dtype=np.float64)
+    if a.size == 0:
+        return "n/a"
+    q = np.percentile(a, [10, 50, 90])
+    return (f"p10 {fmt.format(q[0])} / 中位 {fmt.format(q[1])} / "
+            f"p90 {fmt.format(q[2])}  (min {fmt.format(a.min())}, "
+            f"max {fmt.format(a.max())}, n={a.size})")
+
+
+def summarize(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """把逐点结果汇总成**分布**，并给出每一条判据的**达标点占比**。
+
+    为什么要占比而不是"全部通过"：186 个点里必然有采集质量差的
+    （视角少、覆盖窄、官方全景本身有洞）。要求 186/186 全过，
+    要么指标定得没有意义，要么就是在挑点。所以这里同时给
+    ①中位数 ②达标点占比 ③最差点，三者一起看。
+    """
+    def col(path: str) -> List[float]:
+        out = []
+        for r in rows:
+            if "error" in r:
+                continue
+            cur: Any = r
+            for k in path.split("."):
+                if not isinstance(cur, dict) or k not in cur:
+                    cur = None
+                    break
+                cur = cur[k]
+            if cur is not None:
+                out.append(float(cur))
+        return out
+
+    mae = [x for x in col("depth.mae_m") if np.isfinite(x)]
+    ratio = [x for x in col("depth.median_ratio") if np.isfinite(x)]
+    spread = [b - a for a, b in
+              zip(col("depth.p10_ratio"), col("depth.p90_ratio"))
+              if np.isfinite(a) and np.isfinite(b)]
+    drift = []
+    for r in rows:
+        if "error" in r:
+            continue
+        d = r.get("depth") or {}
+        if "median_ratio_高仰角" in d and "median_ratio_赤道" in d:
+            v = abs(d["median_ratio_高仰角"] - d["median_ratio_赤道"])
+            if np.isfinite(v):
+                drift.append(v)
+    grad = [x for x in col("grad_corr") if np.isfinite(x)]
+    grad_bad = [x for x in col("grad_corr_wrong_conv") if np.isfinite(x)]
+    rgbm = [x for x in col("rgb_mae") if np.isfinite(x)]
+    el = [x for x in col("align.el_shift_rows") if np.isfinite(x)]
+    coverage = [x for x in col("our_coverage") if np.isfinite(x)]
+    n_flip = sum(1 for r in rows
+                 if (r.get("align") or {}).get("az_flip") is True)
+    n_align = sum(1 for r in rows if r.get("align"))
+
+    def frac(vals: Sequence[float], pred) -> Optional[float]:
+        v = [x for x in vals if x is not None and np.isfinite(x)]
+        if not v:
+            return None
+        return float(np.mean([1.0 if pred(x) else 0.0 for x in v]))
+
+    return {
+        "n_points": len(rows),
+        "n_error": sum(1 for r in rows if "error" in r),
+        "n_compared": len(mae),
+        "mae_m": _dist(mae, "{:.4f}"),
+        "mae_median": (float(np.median(mae)) if mae else None),
+        "mae_frac_lt_0.05": frac(mae, lambda x: x < 0.05),
+        "mae_frac_lt_0.10": frac(mae, lambda x: x < 0.10),
+        "mae_frac_lt_0.20": frac(mae, lambda x: x < 0.20),
+        "median_ratio": _dist(ratio, "{:.4f}"),
+        "ratio_frac_within_2pct": frac(ratio, lambda x: abs(x - 1.0) < 0.02),
+        "ratio_frac_within_5pct": frac(ratio, lambda x: abs(x - 1.0) < 0.05),
+        "spread_p90_p10": _dist(spread, "{:.4f}"),
+        "spread_frac_lt_0.10": frac(spread, lambda x: x < 0.10),
+        "elev_drift": _dist(drift, "{:.4f}"),
+        "elev_drift_frac_lt_0.05": frac(drift, lambda x: x < 0.05),
+        "grad_corr": _dist(grad, "{:.4f}"),
+        "grad_corr_frac_gt_0.4": frac(grad, lambda x: x > 0.4),
+        "grad_corr_wrong_conv": _dist(grad_bad, "{:.4f}"),
+        "rgb_mae": _dist(rgbm, "{:.2f}"),
+        "rgb_frac_lt_20": frac(rgbm, lambda x: x < 20.0),
+        "el_shift_rows": _dist(el, "{:.1f}"),
+        "el_shift_frac_le_6": frac(el, lambda x: abs(x) <= 6),
+        "our_coverage": _dist(coverage, "{:.4f}"),
+        "az_flip_frac": (n_flip / n_align) if n_align else None,
+        "mae_values": [round(float(x), 6) for x in mae],
+    }
+
+
+def print_summary(s: Dict[str, Any], *, title: str = "全量分布") -> None:
+    def pct(key: str) -> str:
+        v = s.get(key)
+        return "n/a" if v is None else f"{v*100:.1f}%"
+
+    hr(title)
+    print(f"  参与比对 {s['n_compared']} / {s['n_points']} 个采集点"
+          f"（解析失败 {s['n_error']} 个）")
+    print(f"  深度 MAE (m)      : {s['mae_m']}")
+    print(f"                      <0.05 m {pct('mae_frac_lt_0.05')}  "
+          f"<0.10 m {pct('mae_frac_lt_0.10')}  "
+          f"<0.20 m {pct('mae_frac_lt_0.20')}")
+    print(f"  深度比值中位      : {s['median_ratio']}")
+    print(f"                      |比值−1|<2% {pct('ratio_frac_within_2pct')}  "
+          f"<5% {pct('ratio_frac_within_5pct')}")
+    print(f"  比值 p90−p10 宽度 : {s['spread_p90_p10']}")
+    print(f"                      宽度<0.10 的点 {pct('spread_frac_lt_0.10')}")
+    print(f"  仰角漂移（判 z/r）: {s['elev_drift']}")
+    print(f"                      漂移<0.05 的点 {pct('elev_drift_frac_lt_0.05')}")
+    print(f"  梯度相关          : {s['grad_corr']}")
+    print(f"                      >0.4 的点 {pct('grad_corr_frac_gt_0.4')}"
+          f"（错误方位约定下只有 {s['grad_corr_wrong_conv']}）")
+    print(f"  RGB MAE (/255)    : {s['rgb_mae']}")
+    print(f"                      <20 的点 {pct('rgb_frac_lt_20')}")
+    print(f"  仰角偏移（行）    : {s['el_shift_rows']}")
+    print(f"                      |偏移|≤6 行的点 {pct('el_shift_frac_le_6')}")
+    print(f"  我们的像素覆盖率  : {s['our_coverage']}")
+    if s["az_flip_frac"] is not None:
+        print(f"  判定为「列镜像」的点占比：{pct('az_flip_frac')}"
+              "（应为 100%：官方方位角递增方向与我们相反）")
+    if s.get("mae_values"):
+        a = np.asarray(s["mae_values"], dtype=np.float64)
+        edges = [0, 0.02, 0.05, 0.1, 0.2, 0.5, np.inf]
+        print("  深度 MAE 直方图：")
+        for lo, hi in zip(edges[:-1], edges[1:]):
+            c = int(((a >= lo) & (a < hi)).sum())
+            lab = f"[{lo:g}, {'∞' if not np.isfinite(hi) else format(hi, 'g')})"
+            print(f"      {lab:<12}{c:>4}  {'#' * int(round(c / max(a.size, 1) * 60))}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", type=Path, default=DEFAULT_ROOT)
     ap.add_argument("--room", default="office_6")
-    ap.add_argument("--all", action="store_true", help="跑多个房间")
+    ap.add_argument("--all", action="store_true", help="跑多个房间（抽样 n 个）")
+    ap.add_argument("--every", action="store_true",
+                    help="跑**全部**有官方全景的采集点，每点落盘一次")
+    ap.add_argument("--min-frames", type=int, default=1,
+                    help="--every 模式下最少视角数（默认 1，不挑点）")
     ap.add_argument("--n", type=int, default=3)
     ap.add_argument("--width", type=int, default=2048)
     ap.add_argument("--height", type=int, default=1024)
     ap.add_argument("--max-frames", type=int, default=None)
     ap.add_argument("--max-depth", type=float, default=20.0,
                     help="融合时的斜距上限（默认放宽到 20 m，便于和官方比远场）")
+    ap.add_argument("--out", default=None, help="产物 JSON 路径（--every 建议指定）")
+    ap.add_argument("--resume", action="store_true",
+                    help="跳过产物里已经算过的 uuid")
+    ap.add_argument("--limit", type=int, default=None,
+                    help="只跑前 N 个点（便于分段跑）")
     args = ap.parse_args()
 
     if not args.root.exists():
@@ -284,7 +440,28 @@ def main() -> int:
         return 2
     vw, vh = args.width // 2, args.height // 2      # 比对在小尺寸上做，够用且快
 
-    if args.all:
+    out_path = Path(args.out) if args.out else None
+    done: Dict[str, Dict[str, Any]] = {}
+    if out_path is not None and out_path.exists() and args.resume:
+        try:
+            for r in json.loads(out_path.read_text(encoding="utf-8")):
+                done[str(r.get("uuid"))] = r
+            print(f"[resume] 已有 {len(done)} 个点的结果，将跳过它们")
+        except Exception as e:                                # noqa: BLE001
+            print(f"[resume] 读不出旧产物（{type(e).__name__}: {e}），从头跑")
+
+    if args.every:
+        locs = list_locations(args.root)
+        locs = [l for l in locs if l._path("depth", -1, pano=True) is not None]  # noqa: SLF001
+        locs = [l for l in locs if len(l.frame_ids) >= int(args.min_frames)]
+        locs.sort(key=lambda l: (-len(l.frame_ids), l.room))
+        if args.limit:
+            locs = locs[: int(args.limit)]
+        targets = locs
+        print(f"[every] 目标采集点 {len(targets)} 个"
+              f"（共 {sum(len(l.frame_ids) for l in targets)} 个真实视角，"
+              f"max_frames={args.max_frames}）")
+    elif args.all:
         locs = sorted(list_locations(args.root), key=lambda l: -len(l.frame_ids))
         locs = [l for l in locs if len(l.frame_ids) >= 20]
         idx = np.linspace(0, len(locs) - 1, num=min(args.n, len(locs))).round().astype(int)
@@ -292,16 +469,46 @@ def main() -> int:
     else:
         targets = [select_location(args.root, room=args.room, min_frames=8)]
 
-    results: List[Dict[str, Any]] = []
-    for loc in targets:
-        hr(f"构建全景并比对：{loc.room} ({loc.uuid[:12]})，{len(loc.frame_ids)} 个真实视角")
-        sc = load_scene(args.root, loc, width=args.width, height=args.height,
-                        max_frames=args.max_frames, max_depth=args.max_depth,
-                        with_gt=False)
-        r = compare_scene(sc, loc, width=vw, height=vh,
-                          n_grid=min(1024, vw))
-        print_report(r)
+    results: List[Dict[str, Any]] = list(done.values())
+    t_start = time.time()
+    for i, loc in enumerate(targets, start=1):
+        if str(loc.uuid) in done:
+            continue
+        if not args.every:
+            hr(f"构建全景并比对：{loc.room} ({loc.uuid[:12]})，"
+               f"{len(loc.frame_ids)} 个真实视角")
+        else:
+            print(f"[{i}/{len(targets)}] {loc.room} ({loc.uuid[:12]}) "
+                  f"{len(loc.frame_ids)} 帧 … ", end="", flush=True)
+        t0 = time.time()
+        try:
+            sc = load_scene(args.root, loc, width=args.width, height=args.height,
+                            max_frames=args.max_frames, max_depth=args.max_depth,
+                            with_gt=False)
+            r = compare_scene(sc, loc, width=vw, height=vh,
+                              n_grid=min(1024, vw))
+            r["seconds"] = time.time() - t0
+            r["n_frames_used"] = int(sc.frames_used)
+        except Exception as e:                                # noqa: BLE001
+            r = {"room": loc.room, "uuid": loc.uuid[:12],
+                 "n_frames_available": len(loc.frame_ids),
+                 "error": f"{type(e).__name__}: {e}",
+                 "seconds": time.time() - t0}
         results.append(r)
+        done[str(loc.uuid)] = r
+        if args.every:
+            d = r.get("depth") or {}
+            mae = d.get("mae_m")
+            print(f"{r['seconds']:.1f}s  "
+                  + (f"深度 MAE {mae:.4f} m  比值 {d['median_ratio']:.4f}  "
+                     f"梯度 {r['grad_corr']:.3f}" if mae is not None
+                     else f"跳过（{r.get('error', '覆盖不足')}）"))
+        else:
+            print_report(r)
+        if out_path is not None:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(json.dumps(results, ensure_ascii=False, indent=2),
+                                encoding="utf-8")
 
     hr("汇总与判据")
     ok = True
@@ -311,9 +518,52 @@ def main() -> int:
         print(f"  [{'OK ' if cond else 'FAIL'}] {name}: {detail}")
         ok = ok and cond
 
+    if args.every:
+        s = summarize(results)
+        print(f"  总耗时 {time.time() - t_start:.0f}s")
+        print_summary(s, title=f"全部 {s['n_points']} 个采集点的分布")
+        # 判据改成"中位数 + 达标点占比"：一个长尾点不该被平均掉，
+        # 一个漂亮的中位数也不该掩盖长尾。
+        check("深度 MAE 中位数 < 0.10 m",
+              (s["mae_median"] or 1.0) < 0.10,
+              f"中位 {s['mae_median'] if s['mae_median'] is None else format(s['mae_median'], '.4f')} m")
+        check("≥90% 的采集点深度 MAE < 0.10 m",
+              (s["mae_frac_lt_0.10"] or 0) >= 0.90,
+              f"{s['mae_frac_lt_0.10']*100:.1f}%")
+        check("≥95% 的点深度 MAE < 0.20 m",
+              (s["mae_frac_lt_0.20"] or 0) >= 0.95,
+              f"{s['mae_frac_lt_0.20']*100:.1f}%")
+        check("≥90% 的点比值中位在 1±2% 内",
+              (s["ratio_frac_within_2pct"] or 0) >= 0.90,
+              f"{s['ratio_frac_within_2pct']*100:.1f}%")
+        check("≥90% 的点对齐后梯度相关 > 0.4",
+              (s["grad_corr_frac_gt_0.4"] or 0) >= 0.90,
+              f"{s['grad_corr_frac_gt_0.4']*100:.1f}%")
+        check("方位约定一致：列镜像判定的点占 ≥95%",
+              (s["az_flip_frac"] or 0) >= 0.95,
+              f"{(s['az_flip_frac'] or 0)*100:.1f}%")
+        check("仰角无需翻转：≥95% 的点偏移 ≤6 行",
+              (s["el_shift_frac_le_6"] or 0) >= 0.95,
+              f"{s['el_shift_frac_le_6']*100:.1f}%")
+        check("深度语义是斜距：≥90% 的点仰角漂移 < 0.05",
+              (s["elev_drift_frac_lt_0.05"] or 0) >= 0.90,
+              f"{s['elev_drift_frac_lt_0.05']*100:.1f}%")
+        if out_path is not None:
+            (out_path.parent / (out_path.stem + "_summary.json")).write_text(
+                json.dumps(s, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"\n产物已写入 {out_path} 与 "
+                  f"{out_path.parent / (out_path.stem + '_summary.json')}")
+        print("\n" + "=" * 74)
+        print("结论: " + ("全量分布达标 ✓" if ok else "存在不通过项 ✗（如实记录）"))
+        print("=" * 74)
+        return 0 if ok else 1
+
     # 1) ★ 必须选对**方位约定**：正确约定的梯度相关性要远高于另一种。
     #    这一步是关键 —— 只允许平移时，官方全景的对不上（镜像错误无法靠平移修）。
     for r in results:
+        if "error" in r:
+            check(f"{r['room']} 跑通", False, r["error"])
+            continue
         al = r["align"]
         check(f"{r['room']} 方位约定判定明确",
               al["corr_best"] > al["corr_other_convention"] * 1.5,
@@ -323,12 +573,15 @@ def main() -> int:
               f"{al['el_shift_deg']:+.2f}° ({al['el_shift_rows']} 行)")
 
     # 2) 结构必须真的对上（梯度相关，抗曝光差异）
+    grads = [r["grad_corr"] for r in results if "error" not in r]
     check("对齐后结构一致（梯度相关 > 0.4）",
-          all(r["grad_corr"] > 0.4 for r in results),
-          "; ".join(f"{r['grad_corr']:.4f}" for r in results))
+          all(g > 0.4 for g in grads),
+          "; ".join(f"{g:.4f}" for g in grads))
 
     # 3) 深度必须**逐像素**吻合 —— 这是"融合几何正确"最硬的证据
     for r in results:
+        if "error" in r:
+            continue
         d = r["depth"]
         if not d:
             continue
@@ -348,14 +601,21 @@ def main() -> int:
               f"{abs(d.get('inv_cos_高仰角', 1.0) - d.get('inv_cos_赤道', 1.0)):.3f}")
 
     # 5) RGB 也应吻合
-    check("对齐后 RGB MAE < 20/255",
-          all(r["rgb_mae"] < 20 for r in results if np.isfinite(r["rgb_mae"])),
-          "; ".join(f"{r['rgb_mae']:.2f}" for r in results))
+    rgbm = [r["rgb_mae"] for r in results
+            if "error" not in r and np.isfinite(r.get("rgb_mae", np.nan))]
+    check("对齐后 RGB MAE < 20/255", all(x < 20 for x in rgbm),
+          "; ".join(f"{x:.2f}" for x in rgbm))
 
+    if out_path is not None:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(results, ensure_ascii=False, indent=2),
+                            encoding="utf-8")
+        print(f"\n产物已写入 {out_path}")
     print("\n" + "=" * 74)
     print("结论: " + ("与官方全景一致 ✓" if ok else "存在不通过项 ✗"))
     print("=" * 74)
     return 0 if ok else 1
+
 
 
 if __name__ == "__main__":

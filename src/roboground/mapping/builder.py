@@ -25,12 +25,31 @@ RGB-D 帧
    标签语义兼容 + 中心距离/IoU 达标 → 同一物体；否则新建。
    这与 ConceptGraphs 等工作的做法一致，也是真实机器人系统该有的形态。
 
+   消融（`scripts/42_ablate_association.py`，12 个真实采集点）证明这块**是承重的**：
+   换掉关联改走聚类，命中率从 95.1% 掉到 66.1%、幽灵物体从 1.8% 涨到 28.6%。
+
 2. **体素层与物体层并存**
    体素层承载"开放词汇"（特征向量 + 任意文本可比），
    物体层承载"机器人可用性"（有名字、有中心、有 bbox）。
 
    注意：体素化是**全局**做的，与物体关联解耦；关联完成后，再把体素
    按最近邻挂到各物体上（填 `SemanticObject.voxel_ids`）。
+
+关联的两条实现（`mapping.assoc_strategy`）
+----------------------------------------
+· `"greedy"`：**逐个观测**贪心 —— 每个观测独立挑当前得分最高的轨迹。
+  因为轨迹容量不限，这个"分配问题"是可分的，所以逐观测贪心在
+  **该模型下就是最优的**。
+· `"hungarian"`（默认）：**逐帧**一对一 —— 一帧内的观测与已有轨迹做
+  全局最优分配（`scipy.optimize.linear_sum_assignment`），
+  即"同一条轨迹在一帧里最多认领一个观测"。
+
+两者不是同一个模型：`hungarian` 额外要求"一帧一物体一次观测"，
+这正好堵住了 `greedy` 最大的失效模式 —— 把两个真的不同的物体
+并进同一条轨迹（实测碎裂率 0.79 → 1.04、中心误差中位 0.502 → 0.425 m）。
+它的前提是"一个物体在一帧里最多产生一个检测"，全景臂里跨 ±180°
+被拆成两段的物体是例外（那一段会另起一条轨迹），
+所以 `assoc_strategy` 保留了 `"greedy"` 可切回去。
 """
 
 from __future__ import annotations
@@ -239,8 +258,15 @@ class MapBuilder:
 
         # 关联参数
         self.assoc_radius = float(cfg.get("mapping.assoc_radius", 0.6))
-        self.assoc_iou = float(cfg.get("mapping.assoc_iou", 0.1))
+        # `assoc_iou > 1` = 关闭 IoU 兜底（IoU 恒 ≤ 1）
+        _iou = cfg.get("mapping.assoc_iou", 0.1)
+        self.assoc_iou = None if _iou is None else float(_iou)
         self.assoc_require_label = bool(cfg.get("mapping.assoc_require_label", True))
+        # 关联的**分配方式**：`hungarian`（逐帧全局最优，默认）| `greedy`（逐观测贪心）
+        self.assoc_strategy = str(cfg.get("mapping.assoc_strategy", "hungarian")).lower()
+        # 同帧内"其实是同一个物体"的重复检测合并门限（3D IoU）；>1 = 关闭
+        _mg = cfg.get("mapping.assoc_merge_iou", 0.5)
+        self.assoc_merge_iou = None if _mg is None else float(_mg)
         self.object_mode = str(cfg.get("mapping.object_mode", "association")).lower()
         self.object_max_points = int(cfg.get("mapping.object_max_points", 10_000))
         self.min_observations = int(cfg.get("mapping.min_observations", 1))
@@ -313,13 +339,21 @@ class MapBuilder:
         t2 = time.perf_counter()
 
         # 3) 实例关联 + 4) 体素融合
+        #
+        # ★ 关联按**帧**批量做（`_associate_frame`）：`hungarian` 策略需要
+        #   "这一帧的所有观测一起和已有轨迹做全局最优匹配"。
+        #   先筛掉低置信度，再批量关联，最后按原顺序并入体素网格 ——
+        #   对 `greedy` 而言这与原来的"逐个关联"**完全等价**（顺序都没变）。
         self._ensure_grid()
         conf_thr = float(self.cfg.get("mapping.conf_threshold", 0.0))
+        kept: List[Observation] = []
         for obs in observations:
             if obs.detection.score < conf_thr:
                 self.drop_stats["low_confidence"] += 1
                 continue
-            self._associate(obs)
+            kept.append(obs)
+        self._associate_frame(kept, image_width=int(frame.color.shape[1]))
+        for obs in kept:
             self.grid.add_observation(obs)
         t3 = time.perf_counter()
 
@@ -427,7 +461,11 @@ class MapBuilder:
         return score > 0.5
 
     def _associate(self, obs: Observation) -> _ObjectTrack:
-        """把观测关联到已有轨迹，或新建一条。返回命中的轨迹。"""
+        """把**单个**观测关联到已有轨迹，或新建一条。返回命中的轨迹。
+
+        `greedy` 策略的实现。注意轨迹容量不限：同一帧里的多个观测
+        可以落进同一条轨迹 —— 这正是它在上面说的那种失效模式。
+        """
         if self.object_mode == "clustering":
             # 聚类模式不做实例关联，直接用一条全局轨迹占位
             if not self.tracks:
@@ -435,30 +473,11 @@ class MapBuilder:
             self.tracks[0].add(obs)
             return self.tracks[0]
 
-        center = obs.centroid
-        if center is None:
-            center = np.zeros(3)
-
         best: Optional[_ObjectTrack] = None
         best_score = -1.0
-
         for track in self.tracks:
-            if self.assoc_require_label and not self._labels_compatible(obs.label, track.label):
-                continue
-
-            dist = float(np.linalg.norm(center - track.center))
-            score = -1.0
-
-            if dist <= self.assoc_radius:
-                # 距离越近分越高（归一到 [0,1]）
-                score = 1.0 - dist / max(self.assoc_radius, 1e-6)
-
-            # 距离不达标时再看 3D IoU（应对"中心漂移但体积重叠"的情况）
-            if score < 0 and track.points_count > 0:
-                iou = self._track_observation_iou(track, obs)
-                if iou >= self.assoc_iou:
-                    score = float(iou)
-
+            score = self._match_score(obs, track)
+            # ★ 严格大于：分数并列时保留**先建的那条**轨迹（行为固定，可复现）
             if score > best_score:
                 best, best_score = track, score
 
@@ -468,6 +487,199 @@ class MapBuilder:
 
         best.add(obs)
         return best
+
+    def _match_score(self, obs: Observation, track: _ObjectTrack) -> float:
+        """观测与轨迹的关联得分；`< 0` 表示**不允许**关联。
+
+        ⚠️ 两条关联实现（`_associate` 与 `_associate_frame`）**必须共用**
+        这一个打分函数。否则消融实验（`scripts/42`）比的就成了两套规则，
+        得出来的差值归因不到"分配方式"上。
+        """
+        if self.assoc_require_label and not self._labels_compatible(obs.label, track.label):
+            return -1.0
+
+        center = obs.centroid
+        if center is None:
+            center = np.zeros(3)
+        dist = float(np.linalg.norm(center - track.center))
+
+        if dist <= self.assoc_radius:
+            # 距离越近分越高（归一到 [0,1]）
+            return 1.0 - dist / max(self.assoc_radius, 1e-6)
+
+        # 距离不达标时再看 3D IoU（应对"中心漂移但体积重叠"的情况）。
+        # `assoc_iou > 1` 视为**关闭**这条兜底（IoU 恒 ≤ 1）。
+        # 消融实测：这条兜底在 `greedy` 下是有害的（它会把中心相距 0.6 m 以上
+        # 的两个物体并起来），在 `hungarian` 下无害。
+        if self.assoc_iou is not None and track.points_count > 0:
+            iou = float(self._track_observation_iou(track, obs))
+            if iou >= self.assoc_iou:
+                return iou
+        return -1.0
+
+    def _associate_frame(self, observations: Sequence[Observation],
+                         *, image_width: Optional[int] = None) -> List[_ObjectTrack]:
+        """把**一帧**的观测一次性关联掉（按 `assoc_strategy` 分派）。
+
+        为什么要按帧看：`hungarian` 要的是"这一帧的所有观测 ↔ 已有轨迹的
+        **全局**最优一对一匹配"。逐个观测调用 `_associate` 拿不到全局信息 ——
+        先处理的观测可能把某条轨迹占掉，而它本可以落到另一条上。
+
+        `image_width` 用于识别"跨图像左右边界的接缝"（等距柱状全景的
+        ±180°），调用方知道帧尺寸就传进来。
+        """
+        if self.object_mode == "clustering":
+            return [self._associate(obs) for obs in observations]
+
+        # 先把"同一帧里其实是同一个物体"的重复检测合掉（见方法注释）
+        observations = self._merge_same_frame(observations,
+                                              image_width=image_width)
+
+        if self.assoc_strategy != "hungarian":
+            return [self._associate(obs) for obs in observations]
+
+        n_o, n_t = len(observations), len(self.tracks)
+        if n_o == 0:
+            return []
+
+        # 代价矩阵：左边 `n_t` 列是真实轨迹，右边 `n_o` 列是"哑列"。
+        # 哑列得分为 0，而非法配对给 −1e6 —— 于是"把某个观测空着"
+        # 永远优于"硬塞一个不合法配对"，等价于允许不分配。
+        from scipy.optimize import linear_sum_assignment  # 延迟导入
+
+        M = np.zeros((n_o, n_t + n_o), dtype=np.float64)
+        for i, obs in enumerate(observations):
+            for j, track in enumerate(self.tracks):
+                s = self._match_score(obs, track)
+                # ★ 合法但得分为 0（距离正好等于门限）必须保留：
+                #   旧路径用 `score > -1` 判断，0 是合法的。
+                M[i, j] = s if s >= 0.0 else -1e6
+
+        rows, cols = linear_sum_assignment(-M)
+        out: List[_ObjectTrack] = []
+        for i, j in zip(rows.tolist(), cols.tolist()):
+            if j < n_t and M[i, j] > -1e5:
+                track = self.tracks[j]
+            else:
+                track = _ObjectTrack(len(self.tracks), self.feature_dim,
+                                     self.object_max_points)
+                self.tracks.append(track)
+            track.add(observations[i])
+            out.append(track)
+        return out
+
+    def _merge_same_frame(self, observations: Sequence[Observation], *,
+                          image_width: Optional[int] = None) -> List[Observation]:
+        """把**同一帧里被拆成两段**的同一个物体合回一个观测。
+
+        什么时候会拆：等距柱状全景里跨 ±180° 的物体会被拆成两个 bbox
+        （一个 `Detection2D` 的 bbox 不能越出图像边界，见
+        `pano_scene.box_to_pano` 的 `uv_parts`），于是**同一个物体在一帧里
+        产生两个检测**。`greedy` 下无所谓（两条观测本来就会进同一条轨迹），
+        但 `hungarian` 要求"一条轨迹在一帧里最多认领一个观测"，
+        就会把它算成**两个物体**。实测（office_6，24 视角全景）：
+        24 个可见 GT → 28 个检测，其中 4 个正是跨接缝的
+        （table / window / wall / ceiling），而"有几个 X"这类计数
+        恰好错了这 4 个 —— 一一对应，不是巧合。
+
+        两条判据（任一命中即合并，且都要求**标签兼容**）：
+
+        1. **图像接缝**（`image_width` 已知时）：一段的 `u1` 触到右边界、
+           另一段的 `u0` 落在左边界，且竖直区间重叠 —— 这正是
+           `box_to_pano` 拆框时留下的签名。
+           ⚠️ 这一条**不能**用"3D IoU"代替：天花板/墙这类又宽又靠近极点的
+           物体，被拆开的两段在 3D 里位于房间的**两侧**，点云几乎不相交，
+           IoU ≈ 0，按 IoU 判永远合不上（我第一版就是这么写的，实测无效）。
+        2. **3D IoU ≥ `assoc_merge_iou`**（默认 0.5）：覆盖"两段都投影到
+           同一块体积"的普通重复检测。用 IoU 而不是中心距离，是为了不把
+           "桌子底下的椅子"这类近距离异类并掉。
+
+        两条都失效时（`assoc_merge_iou > 1` 且不传 `image_width`），
+        这个方法退化成"不做任何合并"。
+        """
+        obs_list = list(observations)
+        if len(obs_list) < 2:
+            return obs_list
+        iou_on = self.assoc_merge_iou is not None and self.assoc_merge_iou <= 1.0
+        if not iou_on and image_width is None:
+            return obs_list
+
+        merged: List[Observation] = []
+        for obs in obs_list:
+            hit = -1
+            for i, m in enumerate(merged):
+                if not self._labels_compatible(obs.label, m.label):
+                    continue
+                if image_width is not None and self._wraps_seam(obs, m,
+                                                               int(image_width)):
+                    hit = i
+                    break
+                if iou_on and self._cloud_iou(obs.points_world,
+                                              m.points_world) >= self.assoc_merge_iou:
+                    hit = i
+                    break
+            if hit < 0:
+                merged.append(obs)
+                continue
+            prev = merged[hit]
+            best = prev.detection if prev.detection.score >= obs.detection.score \
+                else obs.detection
+            merged[hit] = Observation(
+                detection=best,
+                points_world=np.concatenate([prev.points_world, obs.points_world],
+                                            axis=0),
+                frame_id=prev.frame_id,
+                timestamp=prev.timestamp,
+            )
+        return merged
+
+    @staticmethod
+    def _wraps_seam(a: Observation, b: Observation, width: int) -> bool:
+        """两段是不是同一个"跨图像左右边界"的框被拆开的两半。
+
+        `box_to_pano` 拆出来的两段长这样：`(u0, v0, W−1, v1)` 与
+        `(0, v0, u1, v1)` —— 一段贴右边界、一段贴左边界，竖直区间相同。
+        这里按这个签名判断，并要求竖直区间**有重叠**。
+        """
+        if width <= 1:
+            return False
+        box_a = np.asarray(a.detection.bbox, dtype=np.float64).reshape(-1)
+        box_b = np.asarray(b.detection.bbox, dtype=np.float64).reshape(-1)
+        if box_a.size < 4 or box_b.size < 4:
+            return False
+
+        def touches_left(bb) -> bool:
+            return float(bb[0]) <= 0.0 + 1e-6
+
+        def touches_right(bb) -> bool:
+            return float(bb[2]) >= float(width - 1) - 1e-6
+
+        def v_overlap(bb1, bb2) -> bool:
+            lo = max(float(bb1[1]), float(bb2[1]))
+            hi = min(float(bb1[3]), float(bb2[3]))
+            return hi >= lo
+
+        return ((touches_right(box_a) and touches_left(box_b))
+                or (touches_right(box_b) and touches_left(box_a))) \
+            and v_overlap(box_a, box_b)
+
+
+    @staticmethod
+    def _cloud_iou(a: np.ndarray, b: np.ndarray) -> float:
+        """两团点云**轴对齐**包围盒的 3D IoU。"""
+        a = np.asarray(a, dtype=np.float64).reshape(-1, 3)
+        b = np.asarray(b, dtype=np.float64).reshape(-1, 3)
+        if a.shape[0] == 0 or b.shape[0] == 0:
+            return 0.0
+        lo = np.maximum(a.min(axis=0), b.min(axis=0))
+        hi = np.minimum(a.max(axis=0), b.max(axis=0))
+        inter = float(np.prod(np.clip(hi - lo, 0.0, None)))
+        va = float(np.prod(np.clip(a.max(axis=0) - a.min(axis=0), 0.0, None)))
+        vb = float(np.prod(np.clip(b.max(axis=0) - b.min(axis=0), 0.0, None)))
+        union = va + vb - inter
+        return float(inter / union) if union > 1e-12 else 0.0
+
+
 
     @staticmethod
     def _track_observation_iou(track: _ObjectTrack, obs: Observation) -> float:

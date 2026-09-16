@@ -98,8 +98,23 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         #     （例如只加载了一张体素网格）；它的问题是两个靠近的物体会被合并。
         "object_mode": "association",
         "assoc_radius": 0.60,       # 米，关联同一物体的中心距离阈值
-        "assoc_iou": 0.10,          # 3D bbox IoU 超过此值也判为同一物体
+        "assoc_iou": 0.10,          # 3D bbox IoU 超过此值也判为同一物体（>1 = 关闭）
         "assoc_require_label": True,  # 关联时是否要求标签语义兼容
+        # 关联的**分配方式**：
+        # "hungarian"（默认）：逐帧全局最优一对一匹配（scipy linear_sum_assignment），
+        #     即"同一条轨迹在一帧里最多认领一个观测"。
+        # "greedy"：逐观测贪心（旧行为），每个观测独立挑最高分轨迹。
+        # 两者共用同一个打分函数（`MapBuilder._match_score`），唯一区别是
+        # "一帧里一条轨迹能不能认领多个观测"。消融依据（12 个真实采集点，
+        # scripts/42_ablate_association.py）：greedy 碎裂率 0.79 / 命中 95.1% /
+        # 中心误差中位 0.502 m；hungarian 碎裂率 1.04 / 命中 98.1% / 0.425 m。
+        "assoc_strategy": "hungarian",
+        # 同帧内"其实是同一个物体"的重复检测合并门限（轴对齐 3D IoU）。
+        # ⚠️ 默认 **None = 关闭**：实测在针孔帧上把"同标签 + IoU ≥ 0.5"的
+        # 检测也合并会变差（命中率 98.1% → 96.7%）—— 并排的两个真不同物体
+        # 包围盒本来就会重叠。真正需要合并的是**等距柱状跨接缝**那一种，
+        # 由图像边界签名判（`MapBuilder._merge_same_frame`），与本项无关。
+        "assoc_merge_iou": None,
         "use_3d_clustering": True,  # object_mode=clustering 时是否启用
         "cluster_eps": 0.08,        # 米，DBSCAN 邻域半径
         "cluster_min_samples": 3,

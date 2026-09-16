@@ -54,8 +54,23 @@ mapping:
   fusion: mean                  # mean | max | confidence_weighted
   object_mode: association      # association（推荐）| clustering（降级）
   assoc_radius: 0.60            # 跨帧关联：中心距离阈值（米）
-  assoc_iou: 0.10               # 或 3D IoU 超过该值也算同一物体
+  assoc_iou: 0.10               # 或 3D IoU 超过该值也算同一物体（>1 = 关闭兜底）
   assoc_require_label: true     # 关联时要求标签语义兼容
+  # 关联的分配方式。hungarian：逐帧全局最优一对一匹配（默认）；
+  # greedy：逐观测贪心（旧行为，逐观测挑最高分轨迹）。
+  # 两者**共用同一打分函数**，唯一区别是"同一条轨迹在一帧里能不能认领多个观测"。
+  # 消融依据（scripts/42_ablate_association.py，12 个真实采集点均值）：
+  #   greedy     碎裂率 0.79  命中率 95.1%  中心误差中位 0.502 m
+  #   hungarian  碎裂率 1.04  命中率 98.1%  中心误差中位 0.425 m
+  assoc_strategy: hungarian
+  # 同帧内"其实是同一个物体"的重复检测合并门限（轴对齐 3D IoU）。
+  # ⚠️ 默认**关闭**（null）：实测在针孔臂上，把"同标签 + 点云 IoU ≥ 0.5"
+  # 的检测也合并会**变差**（12 个采集点命中率 98.1% → 96.7%）——
+  # 因为针孔帧里两个真的不同的物体（并排的两把椅子）包围盒本来就会重叠。
+  # 真正需要合并的只有**等距柱状跨接缝**那一种，由图像边界签名判（见
+  # `MapBuilder._merge_same_frame`），与本开关无关，始终生效。
+  # 这个开关保留下来，是为了能复现上面那次"IoU 合并有害"的测量。
+  assoc_merge_iou: null
   cluster_eps: 0.08
   cluster_min_samples: 3
   object_bbox_percentile: 2.0   # bbox 分位数裁剪，抗离群点

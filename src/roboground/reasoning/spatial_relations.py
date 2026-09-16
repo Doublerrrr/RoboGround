@@ -132,6 +132,24 @@ def dominant_relation(
     if evidence["containment"] >= th["inside_ratio"]:
         return "inside", evidence
 
+    # 1.5) ★ 竖直方向**完全不重叠** → "上/下"没有歧义，直接判，不参与主轴竞争
+    #
+    # 为什么必须放在主轴竞争**之前**：主轴竞争的判据是"归一化分离量最大的
+    # 那个轴"，而归一化用的是**物体尺寸**。对横跨整个房间的结构
+    # （天花板 / 墙 / 地板），它与小物体的**中心**在水平方向差得很远，
+    # 归一化之后 x/y 轴反而占优 —— 于是"天花板在门上面吗"会被答成
+    # "不是：天花板在门的左边"。实测（`scripts/43`，office_6 全景）就是这么错的。
+    # 而"A 的最低点高过 B 的最高点"是人类语义里**没有歧义**的"上面"。
+    # ⚠️ 取的是 **z 轴**（索引 2）的上下界，不是"所有轴的最小值"。
+    a_lo = float(np.asarray(a.bbox_min, dtype=np.float64).reshape(3)[2])
+    a_hi = float(np.asarray(a.bbox_max, dtype=np.float64).reshape(3)[2])
+    b_lo = float(np.asarray(b.bbox_min, dtype=np.float64).reshape(3)[2])
+    b_hi = float(np.asarray(b.bbox_max, dtype=np.float64).reshape(3)[2])
+    if a_lo >= b_hi - 1e-9:
+        return "above", evidence
+    if a_hi <= b_lo + 1e-9:
+        return "below", evidence
+
     # 2) 主轴竞争
     axis = int(np.argmax(np.abs(norm)))
     strength = float(abs(norm[axis]))
@@ -151,7 +169,6 @@ def dominant_relation(
             return ("near" if evidence["center_distance"] <= th["near_threshold"]
                     else "unknown"), evidence
         return ("above" if positive else "below"), evidence
-
     # ---- 水平轴：先看是不是"贴在一起"（旁边），再看方向 ----
     # 为什么只在水平轴做这个判断？
     # 因为"上/下"是接触关系（杯子放在桌上，间隙就是 0），如果对竖直方向也
